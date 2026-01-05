@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 from typing import Optional
 
 from asyncgate.config import settings
@@ -24,16 +25,22 @@ async def lease_sweep_loop():
     - Transition task leased -> queued
     - Increment attempt if appropriate
     - Emit lease.expired receipt (to agent; optionally to worker)
+    
+    Anti-storm protections:
+    - Jittered sweep interval (±20% randomization) prevents synchronized sweeps
+    - Small batch processing (20 tasks/batch) prevents transaction pile-up
+    - Requeue time jitter (0-5s) prevents thundering herd on claim
     """
+    base_interval = settings.lease_sweep_interval_seconds
     logger.info(
-        f"Lease sweep loop started (interval: {settings.lease_sweep_interval_seconds}s)"
+        f"Lease sweep loop started (base interval: {base_interval}s with ±20% jitter)"
     )
 
     while not _shutdown_event.is_set():
         try:
             async with get_session() as session:
                 engine = AsyncGateEngine(session)
-                expired_count = await engine.expire_leases()
+                expired_count = await engine.expire_leases(batch_size=20)
 
                 if expired_count > 0:
                     logger.info(f"Expired {expired_count} leases and requeued tasks")
@@ -41,11 +48,16 @@ async def lease_sweep_loop():
         except Exception as e:
             logger.error(f"Lease sweep error: {e}", exc_info=True)
 
+        # Add jitter to interval: ±20% randomization
+        # Prevents multiple instances from sweeping in lockstep
+        jitter_factor = random.uniform(0.8, 1.2)
+        jittered_interval = base_interval * jitter_factor
+        
         # Wait for next sweep interval or shutdown
         try:
             await asyncio.wait_for(
                 _shutdown_event.wait(),
-                timeout=settings.lease_sweep_interval_seconds,
+                timeout=jittered_interval,
             )
         except asyncio.TimeoutError:
             pass  # Continue loop

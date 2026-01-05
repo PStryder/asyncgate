@@ -1,11 +1,13 @@
 """AsyncGate core engine - canonical operations."""
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.config import settings
@@ -16,6 +18,7 @@ from asyncgate.db.repositories import (
     RelationshipRepository,
     TaskRepository,
 )
+from asyncgate.db.tables import TaskTable
 from asyncgate.engine.errors import (
     InvalidStateTransition,
     LeaseInvalidOrExpired,
@@ -617,13 +620,23 @@ class AsyncGateEngine:
     # System Operations
     # =========================================================================
 
-    async def expire_leases(self) -> int:
+    async def expire_leases(self, batch_size: int = 20) -> int:
         """
-        Expire stale leases and requeue tasks.
+        Expire stale leases and requeue tasks with anti-storm protections.
 
         Called by background sweep task. Only processes leases for tasks
         owned by this AsyncGate instance (multi-instance safe).
+        
+        Args:
+            batch_size: Number of leases to process per batch (default 20).
+                       Smaller batches with jittered requeue times prevent
+                       thundering herd when many leases expire simultaneously.
+        
+        Returns:
+            Total number of expired leases processed.
         """
+        import random
+        
         expired_leases = await self.leases.get_expired(
             limit=100, 
             instance_id=settings.instance_id
@@ -635,12 +648,31 @@ class AsyncGateEngine:
             if not task or task.is_terminal():
                 continue
 
-            # Requeue task
+            # Add jitter to requeue time: 0-5 seconds random delay
+            # This prevents all expired tasks from becoming eligible simultaneously
+            jitter_seconds = random.uniform(0, 5)
+            
+            # Requeue task with jittered delay
             await self.tasks.requeue_with_backoff(
                 lease.tenant_id,
                 lease.task_id,
                 increment_attempt=True,
             )
+            
+            # Update next_eligible_at with jitter
+            # (requeue_with_backoff sets it, we add jitter on top)
+            task = await self.tasks.get(lease.tenant_id, lease.task_id)
+            if task and task.next_eligible_at:
+                from datetime import timedelta
+                jittered_time = task.next_eligible_at + timedelta(seconds=jitter_seconds)
+                await self.session.execute(
+                    update(TaskTable)
+                    .where(
+                        TaskTable.tenant_id == lease.tenant_id,
+                        TaskTable.task_id == lease.task_id,
+                    )
+                    .values(next_eligible_at=jittered_time)
+                )
 
             # Release expired lease
             await self.leases.release(lease.tenant_id, lease.task_id)
@@ -664,6 +696,12 @@ class AsyncGateEngine:
             )
 
             count += 1
+            
+            # Batch processing: commit and pause between batches
+            if count % batch_size == 0:
+                await self.session.commit()
+                # Small pause between batches (10-50ms) to avoid transaction pile-up
+                await asyncio.sleep(random.uniform(0.01, 0.05))
 
         return count
 

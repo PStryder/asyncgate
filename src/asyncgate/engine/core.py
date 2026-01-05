@@ -559,6 +559,24 @@ class AsyncGateEngine:
         if should_requeue:
             task = await self.tasks.requeue_with_backoff(tenant_id, task_id, increment_attempt=True)
             next_eligible_at = task.next_eligible_at
+            
+            # Emit task.requeued receipt to task owner (agent-visible)
+            asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+            await self._emit_receipt(
+                tenant_id=tenant_id,
+                receipt_type=ReceiptType.TASK_FAILED,
+                from_principal=asyncgate_principal,
+                to_principal=task.created_by,
+                task_id=task_id,
+                body={
+                    "reason": "Worker reported retryable failure",
+                    "error": error,
+                    "requeued": True,
+                    "attempt": task.attempt,
+                    "max_attempts": task.max_attempts,
+                    "next_eligible_at": next_eligible_at.isoformat() if next_eligible_at else None,
+                },
+            )
         else:
             # Terminal failure
             task_result = TaskResult(
@@ -572,7 +590,7 @@ class AsyncGateEngine:
             task = await self.tasks.get(tenant_id, task_id)
             await self._emit_result_ready_receipt(tenant_id, task)
 
-        # Emit task.failed receipt
+        # Emit task.failed receipt (system record)
         worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
         asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
 
@@ -813,12 +831,12 @@ class AsyncGateEngine:
             "receipt_type": receipt.receipt_type.value,
             "created_at": receipt.created_at.isoformat(),
             "from": {
-                "kind": receipt.from_principal.kind.value,
-                "id": receipt.from_principal.id,
+                "kind": receipt.from_.kind.value,
+                "id": receipt.from_.id,
             },
             "to": {
-                "kind": receipt.to_principal.kind.value,
-                "id": receipt.to_principal.id,
+                "kind": receipt.to_.kind.value,
+                "id": receipt.to_.id,
             },
             "task_id": str(receipt.task_id) if receipt.task_id else None,
             "lease_id": str(receipt.lease_id) if receipt.lease_id else None,

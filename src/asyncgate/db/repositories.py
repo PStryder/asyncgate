@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.config import settings
@@ -52,15 +53,15 @@ class TaskRepository:
         retry_backoff_seconds: int | None = None,
         delay_seconds: int | None = None,
     ) -> Task:
-        """Create a new task."""
+        """
+        Create a new task.
+        
+        Uses DB-first approach for idempotency: attempts insert and catches
+        unique constraint violation, then fetches existing task. This prevents
+        race conditions from check-then-insert pattern.
+        """
         now = datetime.utcnow()
         task_id = uuid4()
-
-        # Check idempotency
-        if idempotency_key:
-            existing = await self._get_by_idempotency_key(tenant_id, idempotency_key)
-            if existing:
-                return existing
 
         next_eligible_at = now + timedelta(seconds=delay_seconds) if delay_seconds else None
 
@@ -86,9 +87,19 @@ class TaskRepository:
         )
 
         self.session.add(task_row)
-        await self.session.flush()
-
-        return self._row_to_model(task_row)
+        
+        try:
+            await self.session.flush()
+            return self._row_to_model(task_row)
+        except IntegrityError:
+            # Unique constraint violation on idempotency_key - fetch existing
+            await self.session.rollback()
+            if idempotency_key:
+                existing = await self._get_by_idempotency_key(tenant_id, idempotency_key)
+                if existing:
+                    return existing
+            # Re-raise if not idempotency-related
+            raise
 
     async def get(self, tenant_id: UUID, task_id: UUID) -> Task | None:
         """Get a task by ID."""
@@ -629,8 +640,8 @@ class ReceiptRepository:
             tenant_id=row.tenant_id,
             receipt_type=row.receipt_type,
             created_at=row.created_at,
-            **{"from": Principal(kind=PrincipalKind(row.from_kind), id=row.from_id)},
-            to=Principal(kind=PrincipalKind(row.to_kind), id=row.to_id),
+            from_=Principal(kind=PrincipalKind(row.from_kind), id=row.from_id),
+            to_=Principal(kind=PrincipalKind(row.to_kind), id=row.to_id),
             task_id=row.task_id,
             lease_id=row.lease_id,
             schedule_id=row.schedule_id,

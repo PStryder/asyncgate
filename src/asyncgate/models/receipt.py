@@ -18,9 +18,9 @@ class Receipt(BaseModel):
     receipt_type: ReceiptType
     created_at: datetime
 
-    # Sender and recipient
-    from_principal: Principal = Field(alias="from")
-    to_principal: Principal = Field(alias="to")
+    # Sender and recipient (using trailing underscore to avoid reserved keywords)
+    from_: Principal = Field(serialization_alias="from", validation_alias="from")
+    to_: Principal = Field(serialization_alias="to", validation_alias="to")
 
     # Related entities (nullable)
     task_id: Optional[UUID] = None
@@ -42,8 +42,7 @@ class Receipt(BaseModel):
     # Delivery tracking
     delivered_at: Optional[datetime] = None
 
-    class Config:
-        populate_by_name = True
+    model_config = {"populate_by_name": True}
 
 
 class ReceiptBody:

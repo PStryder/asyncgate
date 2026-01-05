@@ -30,16 +30,17 @@ from asyncgate.api.schemas import (
     ReportProgressResponse,
     TaskResponse,
 )
-from asyncgate.api.deps import get_db_session, get_tenant_id
+from asyncgate.api.deps import get_db_session, get_tenant_id, verify_api_key
 from asyncgate.engine import (
     AsyncGateEngine,
     InvalidStateTransition,
     LeaseInvalidOrExpired,
     TaskNotFound,
+    UnauthorizedError,
 )
 from asyncgate.models import Principal, PrincipalKind
 
-router = APIRouter(prefix="/v1")
+router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 
 
 # ============================================================================
@@ -197,6 +198,8 @@ async def cancel_task(
         return CancelTaskResponse(**result)
     except TaskNotFound as e:
         raise HTTPException(status_code=404, detail=e.message)
+    except UnauthorizedError as e:
+        raise HTTPException(status_code=403, detail=e.message)
 
 
 # ============================================================================

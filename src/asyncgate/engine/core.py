@@ -20,6 +20,7 @@ from asyncgate.engine.errors import (
     InvalidStateTransition,
     LeaseInvalidOrExpired,
     TaskNotFound,
+    UnauthorizedError,
 )
 from asyncgate.models import (
     Lease,
@@ -255,6 +256,15 @@ class AsyncGateEngine:
         task = await self.tasks.get(tenant_id, task_id)
         if not task:
             raise TaskNotFound(str(task_id))
+
+        # Authorization: only task owner or system can cancel
+        if principal.kind != PrincipalKind.SYSTEM:
+            if task.created_by.id != principal.id or task.created_by.kind != principal.kind:
+                raise UnauthorizedError(
+                    f"Principal {principal.kind.value}:{principal.id} "
+                    f"not authorized to cancel task owned by "
+                    f"{task.created_by.kind.value}:{task.created_by.id}"
+                )
 
         if task.is_terminal():
             return {"ok": False, "status": task.status.value}

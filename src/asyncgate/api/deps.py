@@ -1,5 +1,6 @@
 """API dependencies."""
 
+import logging
 from typing import AsyncGenerator
 from uuid import UUID
 
@@ -8,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.config import settings
 from asyncgate.db.base import async_session_factory
+
+
+logger = logging.getLogger("asyncgate.api")
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -53,6 +57,10 @@ async def verify_api_key(
     In production, this would validate JWTs or API keys.
     """
     if settings.allow_insecure_dev and settings.env.value == "development":
+        logger.warning(
+            "INSECURE MODE ENABLED: API authentication is disabled. "
+            "Set ASYNCGATE_ALLOW_INSECURE_DEV=false for production."
+        )
         return True
 
     if not settings.api_key:

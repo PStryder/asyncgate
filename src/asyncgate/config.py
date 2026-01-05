@@ -84,7 +84,7 @@ class Settings(BaseSettings):
 
     # Security (v0 - simple shared token)
     api_key: Optional[str] = None
-    allow_insecure_dev: bool = Field(default=True, description="Allow unauthenticated in dev")
+    allow_insecure_dev: bool = Field(default=False, description="Allow unauthenticated in dev")
 
     # JWT settings (for OAuth)
     jwt_algorithm: str = "RS256"

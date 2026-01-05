@@ -173,11 +173,13 @@ class ReceiptTable(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
+        # Unique constraint for receipt deduplication
+        UniqueConstraint("tenant_id", "hash", name="uq_receipt_hash"),
         # Index for receipt queries by recipient
         Index("idx_receipts_to", "tenant_id", "to_kind", "to_id", "created_at"),
         # Index for task receipts
         Index("idx_receipts_task", "tenant_id", "task_id", "created_at"),
-        # Index for deduplication
+        # Index for deduplication (redundant with unique constraint, but kept for explicit queries)
         Index("idx_receipts_hash", "tenant_id", "hash"),
     )
 

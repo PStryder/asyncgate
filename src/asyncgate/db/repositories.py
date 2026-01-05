@@ -422,14 +422,36 @@ class LeaseRepository:
         )
         return result.rowcount > 0
 
-    async def get_expired(self, limit: int = 100) -> list[Lease]:
-        """Get expired leases for cleanup."""
+    async def get_expired(self, limit: int = 100, instance_id: str | None = None) -> list[Lease]:
+        """
+        Get expired leases for cleanup, optionally filtered by instance.
+        
+        Args:
+            limit: Maximum number of leases to return
+            instance_id: Optional instance filter for multi-instance deployments
+        """
         now = datetime.utcnow()
-        result = await self.session.execute(
+        
+        # Build query with join to tasks for instance filtering
+        query = (
             select(LeaseTable)
+            .join(
+                TaskTable,
+                and_(
+                    LeaseTable.tenant_id == TaskTable.tenant_id,
+                    LeaseTable.task_id == TaskTable.task_id,
+                ),
+            )
             .where(LeaseTable.expires_at < now)
-            .limit(limit)
         )
+        
+        # Filter by instance if provided (for multi-instance safety)
+        if instance_id:
+            query = query.where(TaskTable.asyncgate_instance == instance_id)
+        
+        query = query.limit(limit)
+        
+        result = await self.session.execute(query)
         return [self._row_to_model(r) for r in result.scalars().all()]
 
     def _row_to_model(self, row: LeaseTable) -> Lease:
@@ -565,6 +587,25 @@ class ReceiptRepository:
                 ReceiptTable.task_id == task_id,
                 ReceiptTable.to_kind == to_kind,
                 ReceiptTable.to_id == to_id,
+                ReceiptTable.delivered_at.is_(None),
+            )
+        )
+        return [self._row_to_model(r) for r in result.scalars().all()]
+
+    async def get_undelivered_by_type(
+        self,
+        tenant_id: UUID,
+        to_kind: PrincipalKind,
+        to_id: str,
+        receipt_type: ReceiptType,
+    ) -> list[Receipt]:
+        """Get undelivered receipts of a specific type for a principal."""
+        result = await self.session.execute(
+            select(ReceiptTable).where(
+                ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.to_kind == to_kind,
+                ReceiptTable.to_id == to_id,
+                ReceiptTable.receipt_type == receipt_type,
                 ReceiptTable.delivered_at.is_(None),
             )
         )

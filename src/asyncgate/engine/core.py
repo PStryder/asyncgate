@@ -95,19 +95,29 @@ class AsyncGateEngine:
             receipt_ids = [r.receipt_id for r in inbox_receipts]
             await self.receipts.mark_delivered(tenant_id, receipt_ids)
 
-        # Get assigned tasks (owned by this principal)
+        # Get undelivered result_ready receipts (defines waiting_results)
+        undelivered_results = await self.receipts.get_undelivered_by_type(
+            tenant_id=tenant_id,
+            to_kind=principal.kind,
+            to_id=principal.id,
+            receipt_type=ReceiptType.TASK_RESULT_READY,
+        )
+
+        # Build waiting_results from tasks with undelivered result receipts
+        waiting_results = []
+        for receipt in undelivered_results:
+            if receipt.task_id:
+                task = await self.tasks.get(tenant_id, receipt.task_id)
+                if task:
+                    waiting_results.append(self._task_to_summary(task))
+
+        # Get assigned tasks (owned by this principal) for running_or_scheduled
         assigned_tasks, _ = await self.tasks.list(
             tenant_id=tenant_id,
             created_by_id=principal.id,
             limit=max_items,
         )
 
-        # Filter for attention categories
-        waiting_results = [
-            self._task_to_summary(t)
-            for t in assigned_tasks
-            if t.is_terminal()
-        ]
         running_or_scheduled = [
             self._task_to_summary(t)
             for t in assigned_tasks
@@ -593,9 +603,13 @@ class AsyncGateEngine:
         """
         Expire stale leases and requeue tasks.
 
-        Called by background sweep task.
+        Called by background sweep task. Only processes leases for tasks
+        owned by this AsyncGate instance (multi-instance safe).
         """
-        expired_leases = await self.leases.get_expired(limit=100)
+        expired_leases = await self.leases.get_expired(
+            limit=100, 
+            instance_id=settings.instance_id
+        )
         count = 0
 
         for lease in expired_leases:
@@ -662,9 +676,14 @@ class AsyncGateEngine:
         parents: list[UUID] | None = None,
     ) -> Receipt:
         """Emit a receipt (either locally or to MemoryGate)."""
-        # Compute hash for idempotency
+        # Compute hash for idempotency (includes all identifying fields)
         receipt_hash = self._compute_receipt_hash(
-            receipt_type, task_id, from_principal, lease_id
+            receipt_type=receipt_type,
+            task_id=task_id,
+            from_principal=from_principal,
+            to_principal=to_principal,
+            lease_id=lease_id,
+            body=body,
         )
 
         return await self.receipts.create(
@@ -707,18 +726,41 @@ class AsyncGateEngine:
         receipt_type: ReceiptType,
         task_id: UUID | None,
         from_principal: Principal,
+        to_principal: Principal,
         lease_id: UUID | None,
+        body: dict[str, Any] | None,
     ) -> str:
-        """Compute hash for receipt deduplication."""
+        """
+        Compute hash for receipt deduplication.
+        
+        Includes all fields that make a receipt unique to prevent collisions:
+        - receipt_type, task_id, lease_id
+        - from (kind + id)
+        - to (kind + id) 
+        - body (canonical JSON)
+        
+        Returns full 64-character SHA256 hex digest.
+        """
+        # Create canonical body hash if body exists
+        body_hash = None
+        if body:
+            body_canonical = json.dumps(body, sort_keys=True)
+            body_hash = hashlib.sha256(body_canonical.encode()).hexdigest()
+        
+        # Build receipt key from all identifying fields
         data = {
             "receipt_type": receipt_type.value,
             "task_id": str(task_id) if task_id else None,
             "from_kind": from_principal.kind.value,
             "from_id": from_principal.id,
+            "to_kind": to_principal.kind.value,
+            "to_id": to_principal.id,
             "lease_id": str(lease_id) if lease_id else None,
+            "body_hash": body_hash,
         }
         content = json.dumps(data, sort_keys=True)
-        return hashlib.sha256(content.encode()).hexdigest()[:32]
+        # Return full 64-char hex digest (no truncation)
+        return hashlib.sha256(content.encode()).hexdigest()
 
     def _task_to_dict(self, task: Task) -> dict[str, Any]:
         """Convert task to dictionary."""

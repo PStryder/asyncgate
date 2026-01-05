@@ -705,6 +705,72 @@ class AsyncGateEngine:
 
         return count
 
+    # =========================================================================
+    # Receipt Query Operations (Tier 0 - Foundation)
+    # =========================================================================
+
+    async def get_receipt(
+        self,
+        tenant_id: UUID,
+        receipt_id: UUID,
+    ) -> dict[str, Any] | None:
+        """
+        Get a specific receipt by ID.
+        
+        Used for receipt chain traversal and obligation verification.
+        """
+        receipt = await self.receipts.get_by_id(tenant_id, receipt_id)
+        if not receipt:
+            return None
+        return self._receipt_to_dict(receipt)
+
+    async def list_receipts_by_parent(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """
+        List receipts that reference a specific parent.
+        
+        Used by agents to find terminal receipts that discharge obligations.
+        """
+        receipts = await self.receipts.get_by_parent(
+            tenant_id, parent_receipt_id, limit
+        )
+        return [self._receipt_to_dict(r) for r in receipts]
+
+    async def list_open_obligations(
+        self,
+        tenant_id: UUID,
+        principal: Principal,
+        since_receipt_id: UUID | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """
+        List open obligations for a principal.
+        
+        This is the foundation for the new bootstrap model:
+        - Returns receipts that create obligations (task.assigned, etc.)
+        - Filters to only those without terminal child receipts
+        - Pure ledger dump, no bucketing or interpretation
+        
+        An obligation is "open" if no terminal receipt exists that references
+        it as a parent and satisfies the termination rules.
+        """
+        obligations, next_cursor = await self.receipts.list_open_obligations(
+            tenant_id=tenant_id,
+            to_kind=principal.kind,
+            to_id=principal.id,
+            since_receipt_id=since_receipt_id,
+            limit=limit,
+        )
+
+        return {
+            "open_obligations": [self._receipt_to_dict(r) for r in obligations],
+            "cursor": str(next_cursor) if next_cursor else None,
+        }
+
     async def get_config(self) -> dict[str, Any]:
         """Return operational configuration."""
         return {

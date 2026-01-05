@@ -32,6 +32,7 @@ from asyncgate.models import (
     TaskSummary,
 )
 from asyncgate.models.enums import Outcome
+from asyncgate.models.termination import get_terminal_types
 
 
 class TaskRepository:
@@ -632,6 +633,157 @@ class ReceiptRepository:
         )
         row = result.scalar_one_or_none()
         return self._row_to_model(row) if row else None
+
+    async def get_by_id(self, tenant_id: UUID, receipt_id: UUID) -> Receipt | None:
+        """
+        Get a specific receipt by ID.
+        
+        Used for receipt chain traversal and obligation verification.
+        """
+        result = await self.session.execute(
+            select(ReceiptTable).where(
+                ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.receipt_id == receipt_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+        return self._row_to_model(row) if row else None
+
+    async def get_by_parent(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+        limit: int = 50,
+    ) -> list[Receipt]:
+        """
+        Get receipts that reference a specific parent.
+        
+        Used for finding terminal receipts that discharge an obligation.
+        The parents field in receipts is a JSON array, so we need to check containment.
+        
+        Args:
+            tenant_id: Tenant identifier
+            parent_receipt_id: The receipt ID to search for in parents arrays
+            limit: Maximum results to return
+            
+        Returns:
+            List of receipts that have parent_receipt_id in their parents array
+        """
+        # PostgreSQL JSONB containment check
+        # We need to check if the parents array contains the UUID as a string
+        parent_str = str(parent_receipt_id)
+        
+        result = await self.session.execute(
+            select(ReceiptTable)
+            .where(
+                ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.parents.contains([parent_str]),  # JSONB array containment
+            )
+            .order_by(ReceiptTable.created_at.asc())
+            .limit(limit)
+        )
+        return [self._row_to_model(r) for r in result.scalars().all()]
+
+    async def list_open_obligations(
+        self,
+        tenant_id: UUID,
+        to_kind: PrincipalKind,
+        to_id: str,
+        since_receipt_id: UUID | None = None,
+        limit: int = 50,
+    ) -> tuple[list[Receipt], UUID | None]:
+        """
+        List open obligations for a principal.
+        
+        An obligation is "open" if:
+        1. It's a receipt type that can create obligations (in TERMINATION_RULES)
+        2. It's addressed to the specified principal
+        3. No terminal child receipt exists that references it as a parent
+        
+        This is the core bootstrap primitive: dump of uncommitted obligations.
+        
+        Args:
+            tenant_id: Tenant identifier
+            to_kind: Principal kind to filter by
+            to_id: Principal ID to filter by
+            since_receipt_id: Cursor for pagination (return obligations after this)
+            limit: Maximum results to return
+            
+        Returns:
+            Tuple of (obligations list, next_cursor)
+        """
+        # Import here to avoid circular dependency
+        from asyncgate.models.termination import TERMINATION_RULES
+        
+        # Get obligation types (receipt types that create obligations)
+        obligation_types = list(TERMINATION_RULES.keys())
+        
+        if not obligation_types:
+            # No obligation types registered yet
+            return [], None
+        
+        # Base query: receipts to this principal of obligation types
+        query = select(ReceiptTable).where(
+            ReceiptTable.tenant_id == tenant_id,
+            ReceiptTable.to_kind == to_kind,
+            ReceiptTable.to_id == to_id,
+            ReceiptTable.receipt_type.in_(obligation_types),
+        )
+        
+        # Pagination cursor
+        if since_receipt_id:
+            cursor_result = await self.session.execute(
+                select(ReceiptTable.created_at).where(
+                    ReceiptTable.tenant_id == tenant_id,
+                    ReceiptTable.receipt_id == since_receipt_id,
+                )
+            )
+            cursor_time = cursor_result.scalar_one_or_none()
+            if cursor_time:
+                query = query.where(ReceiptTable.created_at > cursor_time)
+        
+        query = query.order_by(ReceiptTable.created_at.asc()).limit(limit * 3)  # Fetch extra for filtering
+        
+        result = await self.session.execute(query)
+        candidate_rows = list(result.scalars().all())
+        
+        # Filter to only obligations without terminal children
+        # This requires checking each candidate's children
+        open_obligations = []
+        
+        for row in candidate_rows:
+            receipt = self._row_to_model(row)
+            
+            # Get terminal types for this obligation
+            terminal_types = get_terminal_types(receipt.receipt_type)
+            if not terminal_types:
+                continue
+            
+            # Check if any terminal receipt references this as parent
+            children_result = await self.session.execute(
+                select(ReceiptTable)
+                .where(
+                    ReceiptTable.tenant_id == tenant_id,
+                    ReceiptTable.receipt_type.in_(terminal_types),
+                    ReceiptTable.parents.contains([str(receipt.receipt_id)]),
+                )
+                .limit(1)
+            )
+            has_terminal_child = children_result.scalar_one_or_none() is not None
+            
+            if not has_terminal_child:
+                open_obligations.append(receipt)
+                
+            # Stop if we have enough
+            if len(open_obligations) >= limit:
+                break
+        
+        # Determine next cursor
+        next_cursor = None
+        if len(open_obligations) >= limit:
+            next_cursor = open_obligations[-1].receipt_id
+        
+        return open_obligations[:limit], next_cursor
 
     def _row_to_model(self, row: ReceiptTable) -> Receipt:
         """Convert database row to model."""

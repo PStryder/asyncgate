@@ -34,7 +34,10 @@ class Settings(BaseSettings):
 
     # General
     env: Environment = Environment.DEVELOPMENT
-    instance_id: str = "asyncgate-1"
+    instance_id: str = Field(
+        default="asyncgate-1",
+        description="Unique instance identifier (auto-detected at startup if not set)",
+    )
     log_level: str = "INFO"
     debug: bool = False
 

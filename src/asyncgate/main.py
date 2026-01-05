@@ -12,6 +12,7 @@ from asyncgate.api import router
 from asyncgate.api.deps import validate_auth_config
 from asyncgate.config import settings
 from asyncgate.db.base import close_db, init_db
+from asyncgate.instance import detect_instance_id, validate_instance_uniqueness
 from asyncgate.tasks.sweep import start_lease_sweep, stop_lease_sweep
 
 # Configure logging
@@ -26,7 +27,18 @@ logger = logging.getLogger("asyncgate")
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     logger.info("Starting AsyncGate server...")
-    logger.info(f"Instance ID: {settings.instance_id}")
+    
+    # Auto-detect instance_id if using default
+    if settings.instance_id == "asyncgate-1":
+        detected_id = detect_instance_id()
+        settings.instance_id = detected_id
+        logger.info(f"Auto-detected instance ID: {settings.instance_id}")
+    else:
+        logger.info(f"Using configured instance ID: {settings.instance_id}")
+    
+    # Validate instance uniqueness (fail fast if unsafe)
+    validate_instance_uniqueness(settings.instance_id, settings.env.value)
+    
     logger.info(f"Environment: {settings.env.value}")
     logger.info(f"Receipt mode: {settings.receipt_mode.value}")
 

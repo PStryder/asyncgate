@@ -51,14 +51,14 @@ class CreateTaskRequest(BaseModel):
 class CreateTaskResponse(BaseModel):
     """Create task response."""
 
-    task_id: str
+    task_id: UUID
     status: str
 
 
 class TaskResponse(BaseModel):
     """Task response."""
 
-    task_id: str
+    task_id: UUID
     type: str
     payload: dict[str, Any]
     created_by: dict[str, Any]
@@ -67,9 +67,9 @@ class TaskResponse(BaseModel):
     status: str
     attempt: int
     max_attempts: int
-    created_at: str
-    updated_at: str
-    next_eligible_at: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    next_eligible_at: Optional[datetime] = None
     result: Optional[dict[str, Any]] = None
     progress: Optional[dict[str, Any]] = None
 
@@ -136,12 +136,12 @@ class LeaseClaimRequest(BaseModel):
 class LeaseInfoSchema(BaseModel):
     """Leased task info."""
 
-    task_id: str
-    lease_id: str
+    task_id: UUID
+    lease_id: UUID
     type: str
     payload: dict[str, Any]
     attempt: int
-    expires_at: str
+    expires_at: datetime
     requirements: Optional[dict[str, Any]] = None
 
 
@@ -165,7 +165,7 @@ class RenewLeaseResponse(BaseModel):
     """Renew lease response."""
 
     ok: bool
-    expires_at: str
+    expires_at: datetime
 
 
 class ReportProgressRequest(BaseModel):
@@ -214,7 +214,7 @@ class FailTaskResponse(BaseModel):
 
     ok: bool
     requeued: bool
-    next_eligible_at: Optional[str] = None
+    next_eligible_at: Optional[datetime] = None
 
 
 # ============================================================================

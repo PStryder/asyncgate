@@ -207,7 +207,7 @@ class AsyncGateEngine:
             ),
         )
 
-        return {"task_id": str(task.task_id), "status": task.status.value}
+        return {"task_id": task.task_id, "status": task.status.value}
 
     async def get_task(
         self,
@@ -393,12 +393,12 @@ class AsyncGateEngine:
                 )
 
                 results.append({
-                    "task_id": str(task.task_id),
-                    "lease_id": str(lease.lease_id),
+                    "task_id": task.task_id,
+                    "lease_id": lease.lease_id,
                     "type": task.type,
                     "payload": task.payload,
                     "attempt": task.attempt,
-                    "expires_at": lease.expires_at.isoformat(),
+                    "expires_at": lease.expires_at,
                     "requirements": task.requirements.model_dump() if task.requirements else None,
                 })
 
@@ -432,7 +432,7 @@ class AsyncGateEngine:
         if not lease:
             raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
 
-        return {"ok": True, "expires_at": lease.expires_at.isoformat()}
+        return {"ok": True, "expires_at": lease.expires_at}
 
     async def report_progress(
         self,
@@ -610,7 +610,7 @@ class AsyncGateEngine:
         return {
             "ok": True,
             "requeued": should_requeue,
-            "next_eligible_at": next_eligible_at.isoformat() if next_eligible_at else None,
+            "next_eligible_at": next_eligible_at,
         }
 
     # =========================================================================
@@ -781,9 +781,9 @@ class AsyncGateEngine:
         return hashlib.sha256(content.encode()).hexdigest()
 
     def _task_to_dict(self, task: Task) -> dict[str, Any]:
-        """Convert task to dictionary."""
+        """Convert task to dictionary with native types."""
         result = {
-            "task_id": str(task.task_id),
+            "task_id": task.task_id,
             "type": task.type,
             "payload": task.payload,
             "created_by": {
@@ -795,9 +795,9 @@ class AsyncGateEngine:
             "status": task.status.value,
             "attempt": task.attempt,
             "max_attempts": task.max_attempts,
-            "created_at": task.created_at.isoformat(),
-            "updated_at": task.updated_at.isoformat(),
-            "next_eligible_at": task.next_eligible_at.isoformat() if task.next_eligible_at else None,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "next_eligible_at": task.next_eligible_at,
         }
 
         if task.result:
@@ -806,7 +806,7 @@ class AsyncGateEngine:
                 "result": task.result.result,
                 "error": task.result.error,
                 "artifacts": task.result.artifacts,
-                "completed_at": task.result.completed_at.isoformat(),
+                "completed_at": task.result.completed_at,
             }
 
         return result
@@ -825,11 +825,11 @@ class AsyncGateEngine:
         )
 
     def _receipt_to_dict(self, receipt: Receipt) -> dict[str, Any]:
-        """Convert receipt to dictionary."""
+        """Convert receipt to dictionary with native types."""
         return {
-            "receipt_id": str(receipt.receipt_id),
+            "receipt_id": receipt.receipt_id,
             "receipt_type": receipt.receipt_type.value,
-            "created_at": receipt.created_at.isoformat(),
+            "created_at": receipt.created_at,
             "from": {
                 "kind": receipt.from_.kind.value,
                 "id": receipt.from_.id,
@@ -838,9 +838,9 @@ class AsyncGateEngine:
                 "kind": receipt.to_.kind.value,
                 "id": receipt.to_.id,
             },
-            "task_id": str(receipt.task_id) if receipt.task_id else None,
-            "lease_id": str(receipt.lease_id) if receipt.lease_id else None,
-            "parents": [str(p) for p in receipt.parents],
+            "task_id": receipt.task_id,
+            "lease_id": receipt.lease_id,
+            "parents": receipt.parents,
             "body": receipt.body,
-            "delivered_at": receipt.delivered_at.isoformat() if receipt.delivered_at else None,
+            "delivered_at": receipt.delivered_at,
         }

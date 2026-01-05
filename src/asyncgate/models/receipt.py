@@ -80,14 +80,42 @@ class ReceiptBody:
     def task_completed(
         result_summary: str,
         result_payload: dict | None = None,
-        artifacts: dict | None = None,
+        artifacts: list[dict] | None = None,
+        delivery_proof: dict | None = None,
         completion_metadata: dict | None = None,
     ) -> dict[str, Any]:
-        """Body for task.completed receipt."""
+        """
+        Body for task.completed receipt.
+        
+        Locatability requirement: Must provide EITHER artifacts OR delivery_proof.
+        
+        Args:
+            result_summary: Human-readable summary of completion
+            result_payload: Optional structured result data
+            artifacts: List of store pointers (work product locations)
+                Examples: [
+                    {"type": "s3", "url": "s3://bucket/key", "etag": "..."},
+                    {"type": "db", "table": "results", "row_id": 123},
+                    {"type": "drive", "file_id": "...", "share_url": "..."}
+                ]
+            delivery_proof: Push delivery confirmation (unopinionated)
+                Schema: {
+                    "mode": "push" | "store",
+                    "target": {...},  # endpoint spec or pointer
+                    "status": "succeeded" | "failed",
+                    "at": "timestamp",
+                    "proof": {...}  # request_id, etag, row_id, http_status, etc.
+                }
+            completion_metadata: Additional context
+            
+        Returns:
+            Receipt body dict
+        """
         return {
             "result_summary": result_summary,
             "result_payload": result_payload,
             "artifacts": artifacts,
+            "delivery_proof": delivery_proof,
             "completion_metadata": completion_metadata or {},
         }
 

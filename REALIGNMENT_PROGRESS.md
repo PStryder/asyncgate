@@ -68,9 +68,62 @@
 
 ---
 
-## NEXT: TIER 1 - Validation (Enforce Correct Patterns)
+## COMPLETED: TIER 1 - Validation (Enforce Correct Patterns)
 
-### T1.1: Enforce Parent Linkage on Terminal Receipts (PRIORITY 1)
+### ✅ T1.1: Enforce Parent Linkage on Terminal Receipts
+**File:** `src/asyncgate/db/repositories.py` (ReceiptRepository.create)
+**Status:** COMPLETE
+
+**What was done:**
+1. Added `is_terminal_type` check before receipt creation
+2. If terminal receipt AND parents empty → ValueError with clear message
+3. Validate each parent exists in database with matching tenant
+4. **Does NOT validate principal matching** (per Hexy's feedback)
+   - Different actors discharge obligations (worker → agent, etc.)
+   - Only validates: tenant matches, parent exists, type is legal
+
+**Prevents:** Footgun A - eternal obligations from parent-less terminal receipts
+
+### ✅ T1.2: Enforce Locatability on Success Discharge (Phase 1 - Lenient)
+**File:** `src/asyncgate/db/repositories.py` (ReceiptRepository.create)
+**Status:** COMPLETE (Phase 1)
+
+**What was done:**
+1. Check `TASK_COMPLETED` receipts for artifacts OR delivery_proof
+2. If NEITHER present:
+   - Strip parents from receipt (obligation stays open!)
+   - Log warning (TODO: emit system.anomaly receipt later)
+   - Allow receipt creation (lenient)
+3. **Critical enforcement:** Obligation NOT discharged without locatability
+
+**Phase 2 (Strict - NOT YET):** Reject receipt entirely with ValueError
+
+**Prevents:** Footgun B - "SUCCEEDED trust me bro" without findable work product
+
+### ✅ T1.3: Add Locatability Fields to ReceiptBody
+**File:** `src/asyncgate/models/receipt.py` (ReceiptBody.task_completed)
+**Status:** COMPLETE
+
+**What was done:**
+1. Changed `artifacts` from `dict` to `list[dict]` (store pointers)
+2. Added `delivery_proof: dict | None` parameter
+3. Documented unopinionated shape per Hexy:
+   ```python
+   delivery_proof = {
+       "mode": "push" | "store",
+       "target": {...},  # endpoint or pointer
+       "status": "succeeded" | "failed",
+       "at": "timestamp",
+       "proof": {...}  # request_id, etag, etc.
+   }
+   ```
+4. Comprehensive docstring with examples
+
+**Enables:** Both push-delivery and store-pointer patterns
+
+---
+
+## NEXT: TIER 2 - Bootstrap Replacement (NOT STARTED)
 **File:** `src/asyncgate/db/repositories.py` (ReceiptRepository.create)
 **Status:** NOT STARTED
 
@@ -84,7 +137,13 @@
                f"Terminal receipt {receipt_type} must specify parents. "
                f"Without parent linkage, obligations remain open forever."
            )
-       # Optionally validate parent exists
+       # Validate parent exists (tenant + receipt_id)
+       # DO NOT validate "parent addressed to same principal"
+       # Different actors discharge obligations:
+       #   - Worker discharges agent's task.assigned
+       #   - AsyncGate discharges worker's lease
+       #   - Scheduler discharges other contracts
+       # Only validate: tenant matches, parent exists, type is legal
    ```
 
 **Why critical:** Without this, terminal receipts won't discharge obligations → haunted bootstrap
@@ -92,6 +151,17 @@
 ### T1.2: Enforce Locatability on Success Discharge (PRIORITY 2)
 **File:** `src/asyncgate/db/repositories.py` or new validation layer
 **Status:** NOT STARTED
+
+**Refined delivery_proof shape (unopinionated):**
+```python
+delivery_proof = {
+    "mode": "push" | "store",  # How delivery happened
+    "target": {...},            # Endpoint spec or pointer
+    "status": "succeeded" | "failed",
+    "at": "timestamp",
+    "proof": {...}              # request_id, etag, row_id, http_status, etc.
+}
+```
 
 **Phase 1 (Lenient - implement first):**
 ```python
@@ -101,7 +171,7 @@ if receipt_type == ReceiptType.TASK_COMPLETED:
     has_delivery_proof = body.get('delivery_proof') is not None
     
     if not (has_artifacts or has_delivery_proof):
-        # Emit anomaly but allow creation
+        # Emit anomaly
         await self._emit_system_anomaly(
             tenant_id=tenant_id,
             kind="success_without_locatability",
@@ -111,6 +181,8 @@ if receipt_type == ReceiptType.TASK_COMPLETED:
                 "message": "Success receipt lacks artifacts or delivery_proof"
             }
         )
+        # CRITICAL: Do NOT treat parent obligation as terminated
+        # This is a partial receipt - doesn't discharge the obligation
 ```
 
 **Phase 2 (Strict - after migration):**
@@ -122,34 +194,42 @@ if not (has_artifacts or has_delivery_proof):
     )
 ```
 
-**Why:** Prevents "SUCCEEDED (trust me bro)" from discharging obligations without making work findable
+**Why:** Prevents "SUCCEEDED (trust me bro)" AND ensures obligation stays open until locatable
 
 ### T1.3: Add Locatability Fields to ReceiptBody (PRIORITY 2)
 **File:** `src/asyncgate/models/receipt.py`
 **Status:** NOT STARTED
 
-Add `delivery_proof` parameter to `ReceiptBody.task_completed()`:
+**Refined shape:**
 ```python
 @staticmethod
 def task_completed(
     result_summary: str,
     result_payload: dict | None = None,
-    artifacts: dict | None = None,  # Existing
-    delivery_proof: dict | None = None,  # NEW
+    artifacts: list[dict] | None = None,  # Store pointers (S3, drive, DB, etc.)
+    delivery_proof: dict | None = None,   # Push delivery confirmation
     completion_metadata: dict | None = None,
 ) -> dict[str, Any]:
     """
     Body for task.completed receipt.
     
     Locatability requirement: Must provide EITHER artifacts OR delivery_proof.
-    - artifacts: Pointers to stored work product (e.g., S3 URLs, drive IDs)
-    - delivery_proof: Evidence of push delivery (delivered_to, ack_receipt_id, timestamp)
+    
+    artifacts: List of store pointers
+      - Examples: [{"type": "s3", "url": "..."}, {"type": "db", "row_id": 123}]
+      
+    delivery_proof: Push delivery confirmation (unopinionated)
+      - mode: "push" | "store"
+      - target: endpoint spec or pointer
+      - status: "succeeded" | "failed"
+      - at: timestamp
+      - proof: request_id, etag, http_status, etc.
     """
     return {
         "result_summary": result_summary,
         "result_payload": result_payload,
         "artifacts": artifacts,
-        "delivery_proof": delivery_proof,  # NEW
+        "delivery_proof": delivery_proof,
         "completion_metadata": completion_metadata or {},
     }
 ```
@@ -160,22 +240,30 @@ def task_completed(
 
 ### T2.1: Create New Bootstrap Endpoint
 **File:** `src/asyncgate/api/router.py` + schemas
-**What:** Add `/v1/bootstrap/obligations` endpoint
-**Returns:** `{server, relationship, open_obligations: [Receipt], cursor}`
+**Endpoint naming consideration (from Hexy):**
+- Option A: `/v1/obligations/open` (reflects model directly)
+- Option B: `/v1/obligations` (simpler)
+- Option C: `/v1/bootstrap/obligations` (parallel to existing)
+**Returns:** `{server: {...}, relationship: {...}, open_obligations: [Receipt], cursor: UUID}`
 **Uses:** `AsyncGateEngine.list_open_obligations()`
 
 ### T2.2: Mark Old Bootstrap Deprecated
-**Add warning header:** `X-AsyncGate-Deprecated: "Use /v1/bootstrap/obligations"`
+**Add warning header:** `X-AsyncGate-Deprecated: "Use /v1/obligations/open"`
+**Log usage** for migration tracking
 
 ### T2.3: Update Engine Bootstrap Logic
 **Remove bucketing:** No more `waiting_results`, `assigned_tasks`, etc.
+**Keep relationship metadata** if `/v1/bootstrap` wrapper maintained
 
 ---
 
 ## TIER 3: Cleanup (NOT STARTED)
 
-### T3.1: Remove delivered_at Control Logic
-**Make delivered_at telemetry-only**, not control plane
+### T3.1: Keep delivered_at as Telemetry (Don't Rush)
+**From Hexy:** Keep `delivered_at` field for observability
+- Useful to know: "Did agent ever successfully retrieve obligations?"
+- Just NEVER use it for control logic (bootstrap filtering, etc.)
+- Telemetry only, not truth
 
 ### T3.2: Deprecate Task-State Bootstrap
 **Keep tasks for execution**, remove from bootstrap truth
@@ -185,17 +273,89 @@ def task_completed(
 
 ---
 
-## TIER 4: Lease/Retry Separation (NOT STARTED)
+## TIER 4: Lease/Retry Separation (NOT STARTED - CONFIRMED CRITICAL)
 
 ### T4.1: Split Lease Expiry from Retry Backoff
-**Prevent "crash eats attempts"** by not incrementing on expiry
+**File:** `src/asyncgate/db/repositories.py` (TaskRepository)
+**From Hexy:** This is a REAL footgun today
+- Lease expiry = "lost authority", NOT "task failed"
+- Burning attempt on expiry causes false terminal failure under flaky workers
+- [ ] Add `requeue_on_expiry(task_id)` method
+  - Does NOT increment `attempt`
+  - Uses minimal jitter (0-5s) instead of retry backoff
+  - Sets `status = QUEUED`
+- [ ] Keep `requeue_with_backoff(task_id, increment_attempt=True)` for failures
+- [ ] Update `AsyncGateEngine.expire_leases()` to use new method
+**Why critical:** Worker crash shouldn't eat all attempts
 
 ---
 
 ## TIER 5: Polish & Documentation (NOT STARTED)
 
-### T5.1: Receipt Size Limits
-### T5.2-T5.4: Documentation Updates
+### T5.1: Receipt Size Limits (Make Error Message a Weapon)
+**File:** `src/asyncgate/db/repositories.py` or validation layer
+**From Hexy:** Receipts are contracts, not chat
+- [ ] Cap receipt body size (e.g., 64KB max)
+- [ ] Cap `parents` length (prevent mega-chains, e.g., max 10)
+- [ ] Cap `artifacts` count (prevent stuffing, e.g., max 100)
+- [ ] Error message: "Receipt bodies are contracts, not chat messages"
+**Why:** Prevent ledger bloat and abuse
+
+### T5.2: Add ARCHITECTURE.md
+**File:** `docs/ARCHITECTURE.md` (NEW)
+- Document obligation model vs. task execution model
+- Explain receipt chain termination
+- Show agent patterns for checking obligation status
+- Migration guide from old bootstrap
+
+### T5.3: Add RECEIPT_PATTERNS.md
+**File:** `docs/RECEIPT_PATTERNS.md` (NEW)
+- Show correct parent linkage
+- Show locatability patterns (artifacts vs delivery_proof)
+- Show how agents detect "work done but no receipt"
+- Anti-patterns to avoid
+
+### T5.4: Update Existing Docs
+**Files:** Various existing docs
+- Update bootstrap examples to use obligations endpoint
+- Remove references to attention/delivery semantics
+- Update worker examples to show parent linkage
+- Update receipt body examples to include locatability
+
+---
+
+## TIER 6: Testing & Validation (NOT STARTED)
+
+### T6.1: Termination Logic Tests
+- [ ] Test obligation chain detection
+- [ ] Test partial chains (obligation without terminal)
+- [ ] Test type compatibility checks
+
+### T6.2: Parent Linkage Tests
+- [ ] Test terminal without parents (should fail)
+- [ ] Test parent to non-existent receipt (should fail)
+- [ ] Test cross-tenant parent references (should fail)
+- [ ] Test different actors discharging obligations (should succeed)
+
+### T6.3: Locatability Tests
+- [ ] Test success without artifacts or proof (anomaly in lenient, error in strict)
+- [ ] Test success with artifacts
+- [ ] Test success with delivery_proof
+- [ ] Test obligation NOT terminated when locatability missing
+
+### T6.4: Bootstrap Obligations Tests
+- [ ] Test pagination via since_receipt_id
+- [ ] Test filtering to principal
+- [ ] Test exclusion of terminated obligations
+- [ ] Test cursor handling
+
+### T6.5: "Bootstrap is Unbucketed" Property Test (NEW from Hexy)
+**Critical anti-regression test:**
+- [ ] Assert `/v1/obligations/open` returns ONLY: `{open_obligations: [Receipt], cursor}`
+- [ ] No `waiting_results`, no task lists, no delivery flags
+- [ ] No "helpful" categorization or bucketing
+- [ ] Pure dump + cursor, nothing else
+**Why:** Prevents regression to inbox model
 
 ---
 

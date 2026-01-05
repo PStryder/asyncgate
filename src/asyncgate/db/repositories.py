@@ -511,6 +511,54 @@ class ReceiptRepository:
             if existing:
                 return existing
 
+        # T1.1: Enforce parent linkage on terminal receipts
+        if is_terminal_type(receipt_type):
+            if not parents or len(parents) == 0:
+                raise ValueError(
+                    f"Terminal receipt type {receipt_type.value} must specify parents. "
+                    f"Without parent linkage, obligations remain open forever (haunted bootstrap). "
+                    f"Terminal receipts discharge obligations - they must reference what they terminate."
+                )
+            
+            # Validate parent exists and shares tenant
+            for parent_id in parents:
+                parent_exists = await self.session.execute(
+                    select(ReceiptTable.receipt_id).where(
+                        ReceiptTable.tenant_id == tenant_id,
+                        ReceiptTable.receipt_id == parent_id,
+                    ).limit(1)
+                )
+                if not parent_exists.scalar_one_or_none():
+                    raise ValueError(
+                        f"Parent receipt {parent_id} not found for tenant {tenant_id}. "
+                        f"Terminal receipts must reference existing obligations."
+                    )
+
+        # T1.2: Enforce locatability on success terminal receipts (Phase 1 - lenient)
+        # If success without locatability: strip parents so obligation stays open, emit anomaly
+        parents_to_use = parents
+        if receipt_type == ReceiptType.TASK_COMPLETED:
+            body_data = body or {}
+            has_artifacts = body_data.get('artifacts') is not None
+            has_delivery_proof = body_data.get('delivery_proof') is not None
+            
+            if not (has_artifacts or has_delivery_proof):
+                # Phase 1 (lenient): Allow creation but strip parents
+                # This keeps obligation open until proper locatable receipt created
+                parents_to_use = []
+                
+                # TODO: Emit system.anomaly receipt
+                # For now, just log it
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"SUCCESS WITHOUT LOCATABILITY: Receipt {receipt_id} for task {task_id} "
+                    f"lacks artifacts or delivery_proof. Parents stripped - obligation stays open. "
+                    f"Producer must fix and resend with locatability."
+                )
+                
+                # In Phase 2 (strict), this would raise ValueError instead
+
         receipt_row = ReceiptTable(
             tenant_id=tenant_id,
             receipt_id=receipt_id,
@@ -523,7 +571,7 @@ class ReceiptRepository:
             task_id=task_id,
             lease_id=lease_id,
             schedule_id=schedule_id,
-            parents=[str(p) for p in (parents or [])],
+            parents=[str(p) for p in (parents_to_use or [])],  # Use potentially stripped parents
             body=body or {},
             hash=receipt_hash,
             asyncgate_instance=settings.instance_id,

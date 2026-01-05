@@ -1,1 +1,167 @@
-"# asyncgate" 
+# AsyncGate
+
+Durable, lease-based asynchronous task execution MCP server.
+
+## Overview
+
+AsyncGate is a standalone MCP server providing durable, lease-based asynchronous execution for agents. It solves: "delegate work without blocking, and reliably recover results later."
+
+AsyncGate does **not** plan, reason, schedule, or orchestrate strategy. It stores work, leases it, and records outcomes.
+
+## Architecture
+
+### Roles
+
+- **Agent (TASKER)**: Creates tasks, fetches status/results
+- **AsyncGate Server**: Source of truth for task state, leases, results, audit trail
+- **Worker Services (TASKEEs)**: External services that claim and execute tasks
+
+### Core Concepts
+
+- **Tasks**: Units of work with type, payload, requirements, and lifecycle state
+- **Leases**: Time-bounded exclusive claims on tasks by workers
+- **Receipts**: Immutable contract records for audit and coordination
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- PostgreSQL 15+
+- Docker (for deployment)
+
+### Local Development
+
+```bash
+# Install dependencies
+pip install -e ".[dev]"
+
+# Set up environment
+export ASYNCGATE_DATABASE_URL="postgresql+asyncpg://asyncgate:asyncgate@localhost:5432/asyncgate"
+
+# Run migrations
+alembic upgrade head
+
+# Start server
+asyncgate
+```
+
+### Docker
+
+```bash
+# Build image
+docker build -t asyncgate .
+
+# Run container
+docker run -p 8080:8080 \
+  -e ASYNCGATE_DATABASE_URL="postgresql+asyncpg://..." \
+  asyncgate
+```
+
+### Fly.io Deployment
+
+```bash
+# Create app (do not deploy yet)
+fly apps create asyncgate
+
+# Create Postgres database
+fly postgres create --name asyncgate-db
+
+# Attach database
+fly postgres attach asyncgate-db --app asyncgate
+
+# Set secrets
+fly secrets set ASYNCGATE_API_KEY="your-secret-key"
+
+# Deploy
+fly deploy
+```
+
+## API
+
+### REST Endpoints
+
+#### TASKER (Agent) Endpoints
+
+- `GET /v1/bootstrap` - Establish session and get attention-aware status
+- `POST /v1/tasks` - Create a new task
+- `GET /v1/tasks/{task_id}` - Get task by ID
+- `GET /v1/tasks` - List tasks
+- `POST /v1/tasks/{task_id}/cancel` - Cancel a task
+- `GET /v1/receipts` - List receipts
+- `POST /v1/receipts/{receipt_id}/ack` - Acknowledge a receipt
+
+#### TASKEE (Worker) Endpoints
+
+- `POST /v1/leases/claim` - Claim next available tasks
+- `POST /v1/leases/renew` - Renew a lease
+- `POST /v1/tasks/{task_id}/progress` - Report progress
+- `POST /v1/tasks/{task_id}/complete` - Mark task completed
+- `POST /v1/tasks/{task_id}/fail` - Mark task failed
+
+### MCP Tools
+
+TASKER tools:
+- `asyncgate.bootstrap`
+- `asyncgate.create_task`
+- `asyncgate.get_task`
+- `asyncgate.list_tasks`
+- `asyncgate.cancel_task`
+- `asyncgate.list_receipts`
+- `asyncgate.ack_receipt`
+
+TASKEE tools:
+- `asyncgate.lease_next`
+- `asyncgate.renew_lease`
+- `asyncgate.report_progress`
+- `asyncgate.complete`
+- `asyncgate.fail`
+
+System:
+- `asyncgate.get_config`
+
+## Configuration
+
+Environment variables (prefix `ASYNCGATE_`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | - | PostgreSQL connection URL |
+| `REDIS_URL` | - | Redis URL for rate limiting |
+| `ENV` | development | Environment (development/staging/production) |
+| `INSTANCE_ID` | asyncgate-1 | Instance identifier |
+| `LOG_LEVEL` | INFO | Logging level |
+| `DEFAULT_LEASE_TTL_SECONDS` | 120 | Default lease TTL |
+| `DEFAULT_MAX_ATTEMPTS` | 2 | Default max retry attempts |
+| `RECEIPT_MODE` | standalone | Receipt storage mode |
+
+## Task Lifecycle
+
+```
+queued -> leased -> running -> succeeded
+                  \         \-> failed -> queued (retry)
+                   \-> canceled
+```
+
+### State Transitions
+
+- `queued -> leased`: Worker claims task
+- `leased -> running`: Worker starts execution (optional)
+- `leased/running -> succeeded`: Task completes successfully
+- `leased/running -> failed`: Task fails (may retry)
+- `queued/leased/running -> canceled`: Task canceled
+- `failed -> queued`: Retry with backoff (if attempts remaining)
+- `leased -> queued`: Lease expires (system-driven)
+
+## Invariants
+
+1. At most one active lease per task
+2. Lease enforcement: mutations require matching lease_id + worker_id
+3. Lease expiry: expired leases allow task to be reclaimed
+4. Idempotent creation: same idempotency_key returns same task_id
+5. Terminal states are immutable
+6. State machine is authoritative; receipts are proofs
+
+## License
+
+MIT

@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from asyncgate.api import router
+from asyncgate.api.deps import validate_auth_config
 from asyncgate.config import settings
 from asyncgate.db.base import close_db, init_db
 from asyncgate.tasks.sweep import start_lease_sweep, stop_lease_sweep
@@ -28,6 +29,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Instance ID: {settings.instance_id}")
     logger.info(f"Environment: {settings.env.value}")
     logger.info(f"Receipt mode: {settings.receipt_mode.value}")
+
+    # Validate authentication configuration (fail fast if insecure)
+    validate_auth_config()
 
     # Initialize database
     await init_db()

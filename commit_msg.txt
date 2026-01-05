@@ -1,0 +1,75 @@
+Tier 0: Foundation for obligation ledger model (architectural realignment)
+
+CONTEXT: AsyncGate currently conflates "task execution substrate" with
+"attention delivery system". This commit begins realignment to correct model:
+AsyncGate is a ledger of obligations, not a message broker.
+
+TIER 0 FOUNDATION - Add New Patterns (No Breaking Changes)
+
+1. Termination Registry (NEW: termination.py)
+   - Defines how obligations are discharged through receipt chains
+   - Maps obligation types to their terminal receipt types
+   - Example: TASK_ASSIGNED → [TASK_COMPLETED, TASK_FAILED, TASK_CANCELED]
+   - Functions: get_terminal_types, is_terminal_type, can_terminate
+   - Core insight: Termination detected from ledger, not task state
+
+2. Receipt Chain Query Primitives (repositories.py + engine/core.py)
+   - Added ReceiptRepository.get_by_id(tenant_id, receipt_id)
+   - Added ReceiptRepository.get_by_parent(tenant_id, parent_id, limit)
+     * Uses PostgreSQL JSONB containment on parents array
+     * Finds terminal receipts that discharge obligations
+   - Added AsyncGateEngine.get_receipt()
+   - Added AsyncGateEngine.list_receipts_by_parent()
+   - Enables agents to walk receipt chains for verification
+
+3. Open Obligations Query (THE BOOTSTRAP PRIMITIVE)
+   - Added ReceiptRepository.list_open_obligations()
+     * Queries obligation types (from termination registry)
+     * Filters to principal
+     * For each candidate, checks if terminal child exists
+     * Returns only obligations WITHOUT terminal discharge
+     * Pagination via since_receipt_id cursor
+   - Added AsyncGateEngine.list_open_obligations()
+     * Returns: {open_obligations: [Receipt], cursor: UUID}
+     * Pure ledger dump, no bucketing, no interpretation
+     * This IS correct bootstrap: uncommitted obligations
+
+KEY CONCEPTS:
+
+Obligation: Receipt that creates commitment (task.assigned, lease.granted)
+Terminal Receipt: Receipt that discharges obligation (task.completed, etc.)
+Parent Linkage: Terminal receipts MUST reference obligation via parents field
+Open Obligation: Obligation without terminal child receipt
+
+Without parent linkage → obligations stay open forever (haunted bootstrap)
+Without locatability → work product unfindable ("SUCCEEDED trust me bro")
+
+CURRENT vs TARGET MODEL:
+
+Current (WRONG):
+- Bootstrap = Attention system with interpreted buckets
+- delivered_at controls visibility
+- Task state = source of truth for obligations
+
+Target (RIGHT):
+- Bootstrap = Open obligations dump from ledger
+- Receipt chains define termination (parents → terminal)
+- Task state = execution tracking only
+
+NO BREAKING CHANGES:
+- All new code alongside existing
+- Old bootstrap still works
+- Enables Tier 1 enforcement (next commit)
+
+NEXT STEPS (Tier 1):
+- Enforce parent linkage on terminal receipts
+- Enforce locatability on success discharge
+- Add delivery_proof field to ReceiptBody
+
+FILES CHANGED:
+- src/asyncgate/models/termination.py (NEW - 158 lines)
+- src/asyncgate/db/repositories.py (MODIFIED - added 3 methods, 135 lines)
+- src/asyncgate/engine/core.py (MODIFIED - added 3 methods, 69 lines)
+- REALIGNMENT_PROGRESS.md (NEW - comprehensive tracking doc)
+
+Compiled cleanly. Ready for Tier 1 enforcement.

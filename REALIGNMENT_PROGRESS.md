@@ -7,51 +7,64 @@
 
 ## COMPLETED: TIER 0 - Foundation (Build New Patterns)
 
-### ✅ T0.1: Termination Registry
-**File:** `src/asyncgate/models/termination.py` (NEW - 158 lines)
+### ✅ T0.1: Termination Registry (CORRECTED)
+**File:** `src/asyncgate/models/termination.py` (NEW - 114 lines)
 
 **What it does:**
-- Defines `TERMINATION_RULES` mapping obligation types to their terminators
-- Example: `TASK_ASSIGNED` → terminated by `[TASK_COMPLETED, TASK_FAILED, TASK_CANCELED]`
-- Provides functions to query termination logic:
-  - `get_terminal_types(obligation_type)` - Get terminators for an obligation
-  - `is_terminal_type(receipt_type)` - Check if type can discharge obligations
-  - `can_terminate(terminal, obligation)` - Verify termination relationship
-  - `is_obligation_terminated(obligation, candidates)` - Check if terminated
-  - `get_terminating_receipt(obligation, ledger)` - Find terminator in ledger
+- Defines termination as TYPE SEMANTICS, not ledger scanning
+- Static truth table: `TERMINATION_RULES: dict[ReceiptType, set[ReceiptType]]`
+- Derived set: `TERMINAL_TYPES` (union of all terminal types)
+- Functions:
+  - `get_terminal_types(obligation_type)` - What types CAN terminate this?
+  - `is_terminal_type(receipt_type)` - Is this type capable of termination?
+  - `can_terminate_type(terminal_type, obligation_type)` - Type compatibility
+  - `get_obligation_types()` - All types that create obligations
 
-**Key insight:** Termination is detected from receipt chains, not task state or delivered_at
+**Key principle:** Separation of concerns
+- Static: "What types are ALLOWED to terminate what" (this module)
+- Runtime: "Did termination happen?" (database query)
+- NO ledger scanning (O(n)) - keeps AsyncGate dumb and fast
 
-### ✅ T0.2: Receipt Chain Query Primitives
+### ✅ T0.2: Receipt Chain Query Primitives (EXTENDED)
 **File:** `src/asyncgate/db/repositories.py` (ReceiptRepository)
 
 **Added methods:**
-- `get_by_id(tenant_id, receipt_id)` - Fetch specific receipt for chain traversal
-- `get_by_parent(tenant_id, parent_receipt_id, limit)` - Find child receipts
-  - Uses PostgreSQL JSONB containment: `parents.contains([parent_str])`
-  - Critical for finding terminal receipts that discharge obligations
+- `get_by_id(tenant_id, receipt_id)` - Fetch specific receipt
+- `get_by_parent(tenant_id, parent_id, limit)` - Find all child receipts
+  - Uses PostgreSQL JSONB containment on parents array
+- **NEW:** `has_terminator(tenant_id, parent_receipt_id) -> bool`
+  - Fast O(1) EXISTS query, doesn't load data
+  - DB-driven termination check
+- **NEW:** `get_terminators(tenant_id, parent_receipt_id, limit)`
+  - Get all receipts that terminate a parent (may include retries/duplicates)
+  - Alias for get_by_parent with clearer semantics
+- **NEW:** `get_latest_terminator(tenant_id, parent_receipt_id)`
+  - Get most recent terminator (canonical one)
+  - Simplifies agent logic when retries/duplicates exist
 
-**Purpose:** Agents can now walk receipt chains to verify obligation status
+**Purpose:** Agents can walk receipt chains efficiently without loading full ledgers
 
-### ✅ T0.3: Open Obligations Query
+### ✅ T0.3: Open Obligations Query (OPTIMIZED)
 **Files:** `src/asyncgate/db/repositories.py` + `src/asyncgate/engine/core.py`
 
 **Repository method:**
 - `list_open_obligations(tenant_id, to_kind, to_id, since_receipt_id, limit)`
-  - Queries receipts of obligation types (from TERMINATION_RULES)
+  - Queries obligation types (from TERMINATION_RULES)
   - Filters to principal
-  - For each candidate, checks if terminal child exists
-  - Returns only obligations without terminal discharge
-  - Pagination via since_receipt_id cursor
+  - For each candidate, uses `has_terminator()` for O(1) check
+  - Returns only obligations without terminators
+  - No semantic inference, pure DB logic
 
 **Engine methods:**
 - `get_receipt(tenant_id, receipt_id)` - Single receipt lookup
-- `list_receipts_by_parent(tenant_id, parent_id, limit)` - Child receipt query
-- `list_open_obligations(tenant_id, principal, since_receipt_id, limit)` - THE BOOTSTRAP PRIMITIVE
+- `list_receipts_by_parent(tenant_id, parent_id, limit)` - All child receipts
+- **NEW:** `get_latest_terminator(tenant_id, parent_id)` - Canonical terminator
+- **NEW:** `has_terminator(tenant_id, parent_id)` - Fast existence check
+- `list_open_obligations(tenant_id, principal, since_receipt_id, limit)`
   - Returns: `{open_obligations: [Receipt], cursor: UUID}`
-  - Pure ledger dump, no bucketing, no interpretation
+  - Pure ledger dump, no bucketing
 
-**This IS the correct bootstrap:** Dump of uncommitted obligations from the ledger
+**This IS the correct bootstrap:** Uncommitted obligations from ledger (DB-driven)
 
 ---
 

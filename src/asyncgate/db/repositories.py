@@ -32,7 +32,11 @@ from asyncgate.models import (
     TaskSummary,
 )
 from asyncgate.models.enums import Outcome
-from asyncgate.models.termination import get_terminal_types
+from asyncgate.models.termination import (
+    get_obligation_types,
+    get_terminal_types,
+    is_terminal_type,
+)
 
 
 class TaskRepository:
@@ -684,6 +688,91 @@ class ReceiptRepository:
         )
         return [self._row_to_model(r) for r in result.scalars().all()]
 
+    async def has_terminator(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+    ) -> bool:
+        """
+        Check if a terminator exists for a parent receipt (fast EXISTS query).
+        
+        DB-driven termination check: Does evidence exist that discharges this obligation?
+        Uses EXISTS for O(1) performance - doesn't load receipt data.
+        
+        Args:
+            tenant_id: Tenant identifier
+            parent_receipt_id: The obligation receipt to check
+            
+        Returns:
+            True if any receipt references this as parent, False otherwise
+        """
+        parent_str = str(parent_receipt_id)
+        
+        result = await self.session.execute(
+            select(ReceiptTable.receipt_id)
+            .where(
+                ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.parents.contains([parent_str]),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def get_terminators(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+        limit: int = 50,
+    ) -> list[Receipt]:
+        """
+        Get all receipts that terminate a parent (may include retries/duplicates).
+        
+        Returns receipts that reference parent_receipt_id in their parents array.
+        Agents use this to walk provenance chains.
+        
+        Args:
+            tenant_id: Tenant identifier
+            parent_receipt_id: The obligation receipt
+            limit: Maximum results to return
+            
+        Returns:
+            List of receipts that reference this parent, ordered by created_at
+        """
+        # This is just an alias for get_by_parent with clearer semantics
+        return await self.get_by_parent(tenant_id, parent_receipt_id, limit)
+
+    async def get_latest_terminator(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+    ) -> Receipt | None:
+        """
+        Get the most recent terminator for a parent receipt.
+        
+        Simplifies agent logic: when multiple terminators exist (retries, duplicates),
+        return the canonical one (most recent by created_at).
+        
+        Args:
+            tenant_id: Tenant identifier
+            parent_receipt_id: The obligation receipt
+            
+        Returns:
+            Most recent terminating receipt, or None if no terminator exists
+        """
+        parent_str = str(parent_receipt_id)
+        
+        result = await self.session.execute(
+            select(ReceiptTable)
+            .where(
+                ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.parents.contains([parent_str]),
+            )
+            .order_by(ReceiptTable.created_at.desc())  # Most recent first
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        return self._row_to_model(row) if row else None
+
     async def list_open_obligations(
         self,
         tenant_id: UUID,
@@ -747,31 +836,17 @@ class ReceiptRepository:
         result = await self.session.execute(query)
         candidate_rows = list(result.scalars().all())
         
-        # Filter to only obligations without terminal children
-        # This requires checking each candidate's children
+        # Filter to only obligations without terminators
+        # Use has_terminator for O(1) EXISTS check per candidate
         open_obligations = []
         
         for row in candidate_rows:
             receipt = self._row_to_model(row)
             
-            # Get terminal types for this obligation
-            terminal_types = get_terminal_types(receipt.receipt_type)
-            if not terminal_types:
-                continue
+            # Fast check: does any receipt reference this as parent?
+            has_term = await self.has_terminator(tenant_id, receipt.receipt_id)
             
-            # Check if any terminal receipt references this as parent
-            children_result = await self.session.execute(
-                select(ReceiptTable)
-                .where(
-                    ReceiptTable.tenant_id == tenant_id,
-                    ReceiptTable.receipt_type.in_(terminal_types),
-                    ReceiptTable.parents.contains([str(receipt.receipt_id)]),
-                )
-                .limit(1)
-            )
-            has_terminal_child = children_result.scalar_one_or_none() is not None
-            
-            if not has_terminal_child:
+            if not has_term:
                 open_obligations.append(receipt)
                 
             # Stop if we have enough

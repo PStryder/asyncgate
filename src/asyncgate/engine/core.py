@@ -731,14 +731,44 @@ class AsyncGateEngine:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         """
-        List receipts that reference a specific parent.
+        List all receipts that reference a specific parent.
         
-        Used by agents to find terminal receipts that discharge obligations.
+        Used by agents to find terminal receipts (may include retries/duplicates).
         """
         receipts = await self.receipts.get_by_parent(
             tenant_id, parent_receipt_id, limit
         )
         return [self._receipt_to_dict(r) for r in receipts]
+
+    async def get_latest_terminator(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+    ) -> dict[str, Any] | None:
+        """
+        Get the most recent terminator for a parent receipt.
+        
+        Simplifies agent logic: when multiple terminators exist (retries, duplicates),
+        return the canonical one (most recent).
+        """
+        receipt = await self.receipts.get_latest_terminator(
+            tenant_id, parent_receipt_id
+        )
+        if not receipt:
+            return None
+        return self._receipt_to_dict(receipt)
+
+    async def has_terminator(
+        self,
+        tenant_id: UUID,
+        parent_receipt_id: UUID,
+    ) -> bool:
+        """
+        Fast check: does a terminator exist for this obligation?
+        
+        DB-driven: O(1) EXISTS query, doesn't load receipt data.
+        """
+        return await self.receipts.has_terminator(tenant_id, parent_receipt_id)
 
     async def list_open_obligations(
         self,
@@ -755,8 +785,8 @@ class AsyncGateEngine:
         - Filters to only those without terminal child receipts
         - Pure ledger dump, no bucketing or interpretation
         
-        An obligation is "open" if no terminal receipt exists that references
-        it as a parent and satisfies the termination rules.
+        An obligation is "open" if no terminator receipt exists that references
+        it as a parent. Termination is detected via DB, not semantic inference.
         """
         obligations, next_cursor = await self.receipts.list_open_obligations(
             tenant_id=tenant_id,

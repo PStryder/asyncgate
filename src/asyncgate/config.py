@@ -56,6 +56,35 @@ class Settings(BaseSettings):
     memorygate_emission_retry_interval_seconds: int = 30
     memorygate_emission_max_retries: int = 10
 
+    # MemoryGate circuit breaker
+    memorygate_circuit_breaker_enabled: bool = Field(
+        default=True, description="Enable circuit breaker for MemoryGate calls"
+    )
+    memorygate_circuit_breaker_failure_threshold: int = Field(
+        default=5, description="Failures before opening circuit"
+    )
+    memorygate_circuit_breaker_timeout_seconds: int = Field(
+        default=60, description="Seconds before attempting half-open"
+    )
+    memorygate_circuit_breaker_half_open_max_calls: int = Field(
+        default=3, description="Test calls in half-open state"
+    )
+    memorygate_circuit_breaker_success_threshold: int = Field(
+        default=2, description="Successes to close from half-open"
+    )
+
+    # Rate limiting
+    rate_limit_enabled: bool = Field(default=False, description="Enable rate limiting")
+    rate_limit_backend: str = Field(
+        default="memory", description="Rate limit backend: memory or redis"
+    )
+    rate_limit_default_calls: int = Field(
+        default=100, description="Default calls per window"
+    )
+    rate_limit_default_window_seconds: int = Field(
+        default=60, description="Default window size in seconds"
+    )
+
     # Lease behavior
     default_lease_ttl_seconds: int = Field(default=120, description="Default lease TTL (2 min)")
     max_lease_ttl_seconds: int = Field(default=1800, description="Max lease TTL (30 min)")

@@ -408,7 +408,7 @@ class AsyncGateEngine:
         if not task:
             raise TaskNotFound(str(task_id))
 
-        if task.status not in (TaskStatus.LEASED, TaskStatus.RUNNING):
+        if task.status != TaskStatus.LEASED:
             raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
 
         lease = await self.leases.renew(

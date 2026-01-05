@@ -21,7 +21,7 @@ async def lease_sweep_loop():
     This is NOT polling workers. It is internal state maintenance:
     - Find leases where expires_at < now and task not terminal
     - Mark lease expired
-    - Transition task leased/running -> queued
+    - Transition task leased -> queued
     - Increment attempt if appropriate
     - Emit lease.expired receipt (to agent; optionally to worker)
     """

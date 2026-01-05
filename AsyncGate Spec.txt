@@ -1,0 +1,2626 @@
+Good. Here’s a **hand-off spec** you can drop in front of Kee and get clean code back from—built around your clarified polarity:
+
+* **AsyncGate = MCP server (control plane + truth store)**
+* **Agent = TASKER**
+* **Workers (incl. Scheduler) = TASKEEs (executors + specialists)**
+
+I’m going to write this like an implementable spec: contracts, invariants, minimal APIs, and a phased MVP.
+
+---
+
+# AsyncGate Spec v0.1 (Standalone MCP Task Substrate)
+
+## 1) Purpose
+
+AsyncGate is a standalone **MCP server** providing durable, lease-based asynchronous execution for agents.
+
+It solves: “delegate work without blocking, and reliably recover results later.”
+
+AsyncGate does **not** plan, reason, schedule, or orchestrate strategy. It stores work, leases it, and records outcomes.
+
+---
+
+## 2) Roles
+
+### Agent (TASKER)
+
+* Creates tasks intentionally.
+* Optionally tags tasks with requirements/capabilities.
+* Later fetches status/results.
+
+### AsyncGate Server
+
+* Source of truth for: task state, leases, results, audit trail.
+* Exposes MCP tools to:
+
+  * create tasks
+  * lease tasks to workers
+  * renew leases
+  * complete/fail tasks
+  * query tasks
+
+### Worker Services (TASKEEs)
+
+* External services running independently.
+* Connect to AsyncGate via MCP client.
+* Claim tasks matching their capabilities, execute them, report outcomes.
+
+### Scheduler Service (a TASKEE)
+
+* A worker that manages timed triggers **only when instructed by the agent**.
+* Stores schedules locally.
+* When schedules fire, creates new tasks in AsyncGate (idempotently).
+
+---
+
+## 3) Core Data Model
+
+### Task
+
+Fields (minimum):
+
+* `task_id` (uuid)
+* `type` (string)
+* `payload` (json)
+* `created_by` (json: `{principal_kind, principal_id}`) — immutable task owner
+* `requirements` (json, optional)
+  Example: `{ "capabilities": ["scheduler"], "tags": ["lowprio"] }`
+* `priority` (int, optional; default 0)
+* `status` enum: `queued | leased | running | succeeded | failed | canceled`
+* `attempt` (int, default 0)
+* `max_attempts` (int, optional; default 3)
+* `retry_backoff_seconds` (int, optional; default 30)
+* `idempotency_key` (string, optional but recommended)
+* `created_at`, `updated_at`
+* `next_eligible_at` (timestamp, optional; for backoff / delayed eligibility)
+
+**Invariant:** At any time, exactly one principal is the authoritative owner of a task, defined by `created_by`. No other receipt or operation may change this field.
+
+### Lease
+
+* `lease_id` (uuid)
+* `task_id` (uuid)
+* `worker_id` (string)
+* `expires_at` (timestamp)
+* `created_at`
+
+### Result (terminal outcome)
+
+* `task_id`
+* `outcome` enum: `succeeded | failed | canceled`
+* `result` (json, nullable)
+* `error` (json, nullable)
+* `artifacts` (json, optional: pointers/urls)
+* `completed_at`
+
+### Progress (optional)
+
+* `task_id`
+* `progress` (json)
+* `updated_at`
+
+### Audit Event (recommended)
+
+* `event_id`
+* `task_id`
+* `event_type`
+* `payload`
+* `created_at`
+
+---
+
+## 4) Non-negotiable Invariants
+
+1. **At most one active lease per task.**
+2. **Lease enforcement:** mutations require matching `lease_id` + `worker_id`.
+3. **Lease expiry:** if expired and not renewed, task becomes eligible for re-lease.
+4. **Idempotent creation:** same `idempotency_key` returns same `task_id` (no dupes).
+5. **State machine enforced** (see below).
+6. **Terminal states immutable** (except adding audit/progress metadata).
+7. **At-least-once semantics** are explicit; duplicates are possible after worker death.
+8. **next_eligible_at** gate is honored for lease attempts (backoff/delay).
+9. **Protocol neutrality:** MCP tool calls map to the same core engine operations.
+10. **Truthful observability:** never infer status; return authoritative state.
+
+---
+
+## 5) State Machine
+
+Allowed transitions:
+
+* `queued -> leased`
+* `leased -> running` (optional; workers may skip and go straight to terminal)
+* `leased | running -> succeeded`
+* `leased | running -> failed`
+* `queued | leased | running -> canceled`
+* `failed -> queued` only if retry policy requeues (and attempts remaining)
+* `leased -> queued` only on lease expiry (system-driven)
+
+Terminal: `succeeded | failed | canceled`
+
+---
+
+## 6) MCP Tool Surface (AsyncGate Server)
+
+### 6.1 Agent-facing tools
+
+#### `asyncgate.create_task`
+
+Input:
+
+* `type: str`
+* `payload: json`
+* `requirements?: json`
+* `priority?: int`
+* `idempotency_key?: str`
+* `max_attempts?: int`
+* `retry_backoff_seconds?: int`
+* `delay_seconds?: int` (optional; sets `next_eligible_at`)
+
+Output:
+
+* `{ task_id, status }`
+
+#### `asyncgate.get_task`
+
+Input: `{ task_id }`
+Output: full task record + result/error if terminal
+
+#### `asyncgate.list_tasks`
+
+Input: `{ status?, type?, limit?, cursor? }`
+Output: `{ tasks: [...], next_cursor? }`
+
+#### `asyncgate.cancel_task`
+
+Input: `{ task_id, reason? }`
+Output: `{ ok, status }`
+
+---
+
+### 6.2 Worker-facing tools
+
+#### `asyncgate.lease_next`
+
+Input:
+
+* `worker_id: str`
+* `capabilities?: [str]` (worker declares)
+* `accept_types?: [str]` (optional filter)
+* `max_tasks?: int` (default 1)
+* `lease_ttl_seconds?: int` (default 300)
+
+Selection rules:
+
+* Only tasks with `status=queued`
+* Only tasks with `next_eligible_at <= now` (or null)
+* Requirements/capabilities must match if specified (see matching below)
+* Highest priority first, then FIFO by created_at
+
+Output:
+
+* `tasks: [{ task_id, lease_id, type, payload, attempt, expires_at, requirements? }]`
+
+#### `asyncgate.renew_lease`
+
+Input: `{ worker_id, task_id, lease_id, extend_by_seconds?: int }`
+Output: `{ ok, expires_at }`
+
+#### `asyncgate.report_progress` (optional)
+
+Input: `{ worker_id, task_id, lease_id, progress: json }`
+Output: `{ ok }`
+
+#### `asyncgate.complete`
+
+Input: `{ worker_id, task_id, lease_id, result: json, artifacts?: json }`
+Output: `{ ok }`
+
+#### `asyncgate.fail`
+
+Input:
+
+* `{ worker_id, task_id, lease_id, error: json, retryable?: bool }`
+
+Behavior:
+
+* If retryable and `attempt+1 < max_attempts`: requeue with backoff (`next_eligible_at = now + backoff * attempt_factor`)
+* Else: mark failed terminal
+
+Output: `{ ok, requeued: bool, next_eligible_at?: ts }`
+
+---
+
+## 7) Requirements / Capability Matching
+
+Minimal v0 rule:
+
+* Task may specify `requirements.capabilities: [str]`
+* Worker provides `capabilities: [str]` to `lease_next`
+* Match if all required capabilities are included in worker capabilities (set containment)
+
+No complex routing beyond that in v0.
+
+---
+
+## 8) Scheduler as TASKEE (External Worker Spec)
+
+Scheduler is a standalone service (separate repo/service) that connects as a worker.
+
+### 8.1 Scheduler-owned local model
+
+Scheduler stores schedules locally (SQLite ok):
+
+* `schedule_id`
+* `enabled`
+* `mode`: `interval | cron` (v0 may be interval only)
+* `interval_seconds` or `cron_expr`
+* `timezone` (optional)
+* `task_template`: `{ type, payload_template, requirements?, priority? }`
+* `misfire_policy`: `skip | catch_up_one | catch_up_all` (default `catch_up_one`)
+* `next_run_at`, `last_run_at`, `last_status`
+
+### 8.2 Scheduler control tasks (leased from AsyncGate)
+
+Task types handled by scheduler worker:
+
+1. `schedule.create`
+   Payload:
+
+* `{ name, mode, interval_seconds|cron_expr, timezone?, task_template, misfire_policy?, jitter_seconds? }`
+  Result:
+* `{ schedule_id, next_run_at }`
+
+2. `schedule.pause`
+   Payload: `{ schedule_id }`
+   Result: `{ ok }`
+
+3. `schedule.resume`
+   Payload: `{ schedule_id }`
+   Result: `{ ok, next_run_at }`
+
+4. `schedule.delete`
+   Payload: `{ schedule_id }`
+   Result: `{ ok }`
+
+5. `schedule.status`
+   Payload: `{ schedule_id }`
+   Result: `{ enabled, next_run_at, last_run_at, last_status }`
+
+### 8.3 When a schedule fires
+
+Scheduler calls `asyncgate.create_task` with:
+
+* `type = task_template.type`
+* `payload = render(payload_template, now, schedule_id, run_at)`
+* `requirements/priority` copied through
+* `idempotency_key = "schedule:{schedule_id}:{run_at_iso}"`
+
+This prevents duplicates if scheduler restarts.
+
+---
+
+## 9) Storage + Runtime
+
+* Python service recommended.
+* DB: SQLite for dev, Postgres for prod.
+* Must support atomic lease claiming (transaction or advisory lock).
+
+---
+
+## 10) MVP Phases
+
+### Phase A — AsyncGate core (no scheduler)
+
+* Implement task create/get/list/cancel
+* Implement lease_next/renew/complete/fail
+* Enforce invariants + state machine
+* Basic capability matching
+* Basic backoff retry
+
+### Phase B — Worker reference implementation
+
+* A simple worker that handles:
+
+  * `sleep_then_return`
+  * `http_get`
+  * `echo`
+
+### Phase C — Scheduler TASKEE
+
+* Implement scheduler worker service
+* Support interval schedules only (cron later)
+* Control tasks: create/pause/resume/delete/status
+* Fire schedules → create AsyncGate tasks idempotently
+
+---
+
+## 11) Definition of Done
+
+* Killing a worker mid-task does not corrupt state; lease expires and task requeues.
+* Replaying `create_task` with same idempotency key does not duplicate.
+* Scheduler restart does not duplicate schedule firings (idempotency keys).
+* Agent can query tasks/results after time passes and recover context.
+
+AsyncGate Spec Addendum: Bootstrap + Receipts
+12) Bootstrap MCP Function
+asyncgate.bootstrap
+
+Purpose: establish session identity + return a relationship-aware status packet so the agent immediately knows:
+
+who it is (as AsyncGate sees it)
+
+what AsyncGate is responsible for
+
+what needs attention right now (results, assigned tasks, anomalies)
+
+Input
+
+agent_id: str (required)
+
+agent_instance_id?: str (optional; allows “this device/session” tracking)
+
+agent_version?: str
+
+client_capabilities?: json (optional)
+
+since_receipt_id?: str (optional; incremental fetch cursor)
+
+max_items?: int (default 50)
+
+Output
+
+server: { name, version, uptime, environment }
+
+relationship: { first_seen_at, last_seen_at, sessions_count, agent_id, agent_instance_id? }
+
+attention:
+
+inbox_receipts: [Receipt] (new receipts addressed to the agent)
+
+assigned_tasks: [TaskSummary] (tasks where agent is the owner/tasker)
+
+waiting_results: [TaskSummary] (completed tasks not yet “acknowledged” by agent)
+
+running_or_scheduled: [TaskSummary] (tasks in leased/running/delayed states the agent should know about)
+
+anomalies: [Anomaly] (stuck leases, repeated failures, expired schedules, etc.)
+
+cursor: { latest_receipt_id }
+
+Notes
+
+Bootstrap is idempotent and safe to call frequently.
+
+It does not mutate tasks except updating last_seen_at for the agent relationship record.
+
+13) Receipts (Immutable Contract Records)
+
+AsyncGate uses immutable receipts as the authoritative record of obligations and state changes between components.
+
+Receipt Principles
+
+Immutable: receipts are append-only; never edited or deleted (retention policy may archive, not rewrite).
+
+Verifiable linkage: receipts reference related receipts via IDs (chain-of-custody).
+
+Role-scoped: receipts are to a target inbox (agent, asyncgate, worker).
+
+Minimal semantic payload: receipts carry the contract, not the implementation.
+
+Receipt Fields (minimum)
+
+receipt_id: uuid
+
+receipt_type: str (see types below)
+
+created_at: timestamp
+
+from: { kind: "agent"|"asyncgate"|"worker", id: str }
+
+to: { kind: "agent"|"asyncgate"|"worker", id: str }
+
+task_id: uuid (nullable for non-task receipts)
+
+lease_id?: uuid
+
+schedule_id?: str
+
+parents?: [uuid] (0..n; causal linkage)
+
+body: json (type-specific payload)
+
+hash?: str (optional integrity — computed over canonical receipt payload excluding delivery metadata and timestamps; used for deduplication and equivalence checks, not cryptographic verification)
+
+signature?: str (optional; future)
+
+Receipt Storage
+
+Receipts are stored in AsyncGate DB in a receipts table.
+
+Bootstrap returns receipts addressed to the agent since a cursor (or most recent N).
+
+14) Receipt Types (v0 set)
+14.1 Task assignment contract (Agent → AsyncGate)
+
+Type: task.assigned
+
+From: agent
+
+To: asyncgate
+
+Body:
+
+instructions: high-level execution intent (no prompts, just contract)
+
+requirements (capabilities/tags)
+
+success_criteria (optional)
+
+result_delivery: where/how the agent expects the outcome (e.g. “return result payload”, “store artifact pointer”)
+
+timeouts: { lease_ttl, deadline? } (optional)
+
+Meaning: AsyncGate is obligated to ensure the task enters the substrate and is leasable under stated constraints.
+
+AsyncGate should create the Task record (if not already created via create_task) and link the receipt to the resulting task_id.
+
+Implementation note: you can keep asyncgate.create_task as-is; task.assigned is the durable “narrative contract” record. Either can create the task, but the receipt is the contract.
+
+14.2 Task accepted by worker (Worker → AsyncGate)
+
+Type: task.accepted
+
+From: worker
+
+To: asyncgate
+
+Requires: valid lease
+
+Body:
+
+worker_capabilities
+
+expected_duration (optional)
+
+Meaning: Worker inherits responsibility to produce outcome per lease and task contract.
+
+14.3 Task completed (Worker → AsyncGate)
+
+Type: task.completed
+
+From: worker
+
+To: asyncgate
+
+Body:
+
+result_summary
+
+result_payload? (optional; for small results)
+
+artifacts? (pointers/urls/ids)
+
+completion_metadata (timings, stats)
+
+AsyncGate marks task terminal and stores result, then emits a receipt to the agent.
+
+14.4 Task failed (Worker → AsyncGate)
+
+Type: task.failed
+
+From: worker
+
+To: asyncgate
+
+Body:
+
+error
+
+retry_recommended (bool)
+
+retry_after_seconds?
+
+AsyncGate applies retry policy or marks terminal, then emits receipt to agent.
+
+14.5 Result delivered to agent (AsyncGate → Agent)
+
+Type: task.result_ready
+
+From: asyncgate
+
+To: agent
+
+Body:
+
+status succeeded/failed/canceled
+
+result_payload? or error
+
+artifacts?
+
+how_to_retrieve (if result is too large, include pointers)
+
+14.6 Lease expired / requeued (AsyncGate → Agent + optional Worker)
+
+Type: lease.expired
+
+Body: { task_id, previous_worker_id, attempt, requeued: true }
+
+14.7 Informational / anomaly receipts
+
+Type: system.anomaly
+
+Body: { kind, details, recommended_action }
+
+15) “AsyncGate Does Not Poll” Rule (Operational Semantics)
+
+AsyncGate is receipt + DB driven, not active monitoring.
+
+Core rule
+
+Once a task is leased:
+
+AsyncGate does not poll workers.
+
+AsyncGate waits for:
+
+worker tool calls (complete, fail, report_progress, renew_lease) which update DB and emit receipts
+
+lease expiry timeouts, handled by server-side periodic sweep (DB-based)
+
+Lease expiry handling
+
+AsyncGate must run a lightweight periodic sweep:
+
+Find leases where expires_at < now and task not terminal
+
+Mark lease expired
+
+Transition task leased/running -> queued
+
+Increment attempt if appropriate
+
+Emit lease.expired receipt (to agent; optionally to worker)
+
+This is not “polling a job.” It is internal state maintenance.
+
+16) Agent Attention Model (Bootstrap Output Rules)
+
+Bootstrap should aggregate attention based on receipts + task state:
+
+“Tasks assigned to the agent”
+
+Definition: tasks where created_by.agent_id == agent_id OR last task.assigned receipt from.agent_id == agent_id.
+
+“Results waiting”
+
+Definition: tasks terminal AND a task.result_ready receipt exists for the agent but has not been acknowledged (optional ack), OR task terminal with no subsequent “agent_seen” marker.
+
+Optional: add asyncgate.ack_receipt(receipt_id) so the agent can mark items as handled.
+
+“Running/scheduled”
+
+Definition:
+
+tasks with status leased|running
+
+tasks queued but next_eligible_at in the future (delayed)
+
+schedule-control tasks in-flight (if using scheduler TASKEE pattern)
+
+17) Minimal Additions to Existing Tool Surface
+
+Add MCP tools:
+
+asyncgate.bootstrap (as above)
+
+Optional but recommended:
+2) asyncgate.list_receipts
+
+Input: { to_kind, to_id, since_receipt_id?, limit? }
+
+Output: { receipts: [...], cursor }
+
+asyncgate.ack_receipt
+
+Input: { receipt_id }
+
+Output: { ok }
+(Implemented as an append-only receipt.acknowledged receipt, not a mutable flag.)
+
+18) Protocol Symmetry (Canonical Operations + MCP/REST Mappings)
+18.1 Design Principle
+
+AsyncGate supports agentic systems and “dumb” software as both:
+
+TASKER (posts work, checks status, consumes results)
+
+TASKEE (claims leases, performs work, posts outcomes)
+
+This is achieved by:
+
+One canonical engine API (domain operations)
+
+Two protocol façades (MCP + REST)
+
+Shared invariants, shared state machine, shared receipts
+
+Rule: MCP and REST MUST be semantically equivalent. No capability exists in one protocol that changes the meaning of tasks/leases/results compared to the other.
+
+18.2 Identity Model (Protocol-Agnostic)
+
+All callers are “principals”:
+
+principal_kind: "agent" | "service" | "system" | "human"
+
+principal_id: str
+
+Optional: principal_instance_id: str (for session/device instances)
+
+Leases and receipts MUST record principals uniformly. Avoid hardcoding “agent vs service” logic.
+
+18.3 Canonical Operations (Engine Layer)
+
+AsyncGate implements the following canonical operations, grouped by role:
+
+A) TASKER operations (post/observe/control)
+
+bootstrap(principal)
+
+create_task(task_spec)
+
+get_task(task_id)
+
+list_tasks(filters, cursor)
+
+cancel_task(task_id, reason?)
+
+list_receipts(to_principal, since_cursor, limit)
+
+ack_receipt(receipt_id) (implemented as append-only receipt, not a mutable flag)
+
+B) TASKEE operations (lease/execute/report)
+
+lease_next(worker_principal, filters, lease_ttl, max_tasks)
+
+renew_lease(worker_principal, task_id, lease_id, extend_by)
+
+report_progress(worker_principal, task_id, lease_id, progress)
+
+complete(worker_principal, task_id, lease_id, result, artifacts?)
+
+fail(worker_principal, task_id, lease_id, error, retryable?)
+
+18.4 MCP Tool Mapping (Facade A)
+TASKER Tools
+
+asyncgate.bootstrap
+
+asyncgate.create_task
+
+asyncgate.get_task
+
+asyncgate.list_tasks
+
+asyncgate.cancel_task
+
+asyncgate.list_receipts
+
+asyncgate.ack_receipt
+
+TASKEE Tools
+
+asyncgate.lease_next
+
+asyncgate.renew_lease
+
+asyncgate.report_progress (optional)
+
+asyncgate.complete
+
+asyncgate.fail
+
+MCP Note: “Tools” are protocol handles only. They must not imply exploration or autonomy. They are RPC endpoints for canonical operations.
+
+18.5 REST Endpoint Mapping (Facade B)
+
+Base URL: /v1
+
+TASKER Endpoints
+
+Bootstrap
+
+GET /v1/bootstrap
+
+query/body: { principal_kind, principal_id, principal_instance_id?, since_receipt_id?, max_items? }
+
+returns: bootstrap packet (same schema as MCP)
+
+Create Task
+
+POST /v1/tasks
+
+body: task spec
+
+returns: { task_id, status }
+
+Get Task
+
+GET /v1/tasks/{task_id}
+
+returns: task record (+ result/error if terminal)
+
+List Tasks
+
+GET /v1/tasks
+
+query: status?, type?, created_by?, limit?, cursor?
+
+returns: { tasks, next_cursor? }
+
+Cancel Task
+
+POST /v1/tasks/{task_id}/cancel
+
+body: { principal_kind, principal_id, reason? }
+
+returns: { ok, status }
+
+List Receipts
+
+GET /v1/receipts
+
+query: to_kind, to_id, since_receipt_id?, limit?
+
+returns: { receipts, next_cursor? }
+
+Ack Receipt
+
+POST /v1/receipts/{receipt_id}/ack
+
+body: { principal_kind, principal_id }
+
+returns: { ok }
+
+must create an append-only receipt.acknowledged receipt
+
+TASKEE Endpoints (REST worker compatibility)
+
+Lease Next
+
+POST /v1/leases/claim
+
+body:
+
+worker_kind, worker_id, worker_instance_id?
+
+capabilities?: [str]
+
+accept_types?: [str]
+
+max_tasks?: int
+
+lease_ttl_seconds?: int
+
+returns: [{ task_id, lease_id, type, payload, attempt, expires_at, requirements? }]
+
+Renew Lease
+
+POST /v1/leases/renew
+
+body: { worker_kind, worker_id, task_id, lease_id, extend_by_seconds? }
+
+returns: { ok, expires_at }
+
+Report Progress
+
+POST /v1/tasks/{task_id}/progress
+
+body: { worker_kind, worker_id, lease_id, progress }
+
+returns: { ok }
+
+Complete Task
+
+POST /v1/tasks/{task_id}/complete
+
+body: { worker_kind, worker_id, lease_id, result, artifacts? }
+
+returns: { ok }
+
+Fail Task
+
+POST /v1/tasks/{task_id}/fail
+
+body: { worker_kind, worker_id, lease_id, error, retryable? }
+
+returns: { ok, requeued, next_eligible_at? }
+
+18.6 Receipt Emission Matrix (Canonical Truth Events)
+
+Receipts are emitted regardless of protocol used. REST and MCP calls MUST produce identical receipt side effects.
+
+TASKER-facing receipts
+
+task.assigned (from TASKER → to ASYNCGATE)
+
+created when: task is “assigned” explicitly OR create_task includes tasker_principal and emit_assignment_receipt=true (config)
+
+task.result_ready (from ASYNCGATE → to TASKER)
+
+created when: task reaches terminal state (succeeded/failed/canceled)
+
+TASKEE-facing receipts
+
+task.accepted (from TASKEE → to ASYNCGATE)
+
+created when: lease is successfully claimed (or when worker explicitly “accepts” after claim—choose one; v0 recommends on claim)
+
+task.completed (from TASKEE → to ASYNCGATE)
+
+created when: complete() called and accepted
+
+task.failed (from TASKEE → to ASYNCGATE)
+
+created when: fail() called and accepted
+
+System/anomaly receipts
+
+lease.expired (from ASYNCGATE → to TASKER, optional to TASKEE)
+
+created when: lease sweep expires a lease and task is requeued
+
+system.anomaly
+
+created when: invariant-risk conditions detected (e.g., repeated failures, stuck requeues, clock skew, etc.)
+
+Optional acknowledgements
+
+receipt.acknowledged (from TASKER → to ASYNCGATE)
+
+created when: ack_receipt called (append-only; no mutable “seen” flag)
+
+18.7 Bootstrap Packet: Protocol-Neutral Schema
+
+Bootstrap is conceptually a “relationship + attention” query available to any principal.
+
+Minimum bootstrap output:
+
+server: { name, version, uptime }
+
+relationship: { principal_kind, principal_id, first_seen_at, last_seen_at, sessions_count }
+
+attention:
+
+inbox_receipts: receipts where to == principal
+
+waiting_results: terminal tasks that have an undelivered or unacknowledged task.result_ready
+
+running_or_scheduled: tasks created_by principal that are not terminal (queued/leased/running/delayed)
+
+anomalies: system notices relevant to this principal
+
+cursor: { latest_receipt_id }
+
+18.8 Canonical Selection Rules (Lease Next)
+
+Whether called via MCP or REST:
+
+only status=queued
+
+only next_eligible_at <= now (or null)
+
+capability matching: required capabilities ⊆ worker capabilities
+
+ordering: highest priority first, then oldest created_at
+
+claim is atomic; returns leases with expires_at
+
+18.9 Canonical Failure Semantics
+
+complete/fail with invalid lease → reject (no mutation) + optional anomaly receipt
+
+fail with retryable + attempts remaining → requeue + set next_eligible_at backoff + emit receipts
+
+server never polls workers; only performs internal lease expiry sweeps
+
+# 19) Config & Defaults (v0 Baseline)
+
+## 19.1 Global Server Defaults
+
+These defaults apply unless explicitly overridden per task or per lease request.
+
+### Time + clocks
+
+* **All timestamps stored in UTC**
+* Server MUST treat client-provided timestamps as untrusted (only use for display/logs unless explicitly allowed)
+
+### Lease behavior
+
+* `DEFAULT_LEASE_TTL_SECONDS = 300` *(5 minutes)*
+* `MAX_LEASE_TTL_SECONDS = 1800` *(30 minutes; clamp if caller requests more)*
+* `LEASE_SWEEP_INTERVAL_SECONDS = 10` *(expire/requeue sweep cadence)*
+* `LEASE_GRACE_SECONDS = 0` *(v0: no grace; if you want slack, set 5–10 seconds)*
+
+### Task retries
+
+* `DEFAULT_MAX_ATTEMPTS = 3`
+* `DEFAULT_RETRY_BACKOFF_SECONDS = 30`
+* Backoff curve: **exponential-ish** with attempt factor
+  `next_delay = base_backoff * (2 ** (attempt - 1))`
+  Example: attempt 1→30s, attempt 2→60s, attempt 3→120s
+* `MAX_RETRY_BACKOFF_SECONDS = 900` *(15 minutes cap)*
+
+### Task ordering
+
+* `DEFAULT_PRIORITY = 0`
+* Ordering rule: higher `priority` first, then older `created_at` first
+
+### Pagination
+
+* `DEFAULT_LIST_LIMIT = 50`
+* `MAX_LIST_LIMIT = 200`
+
+### Receipts
+
+* `DEFAULT_BOOTSTRAP_MAX_ITEMS = 50`
+* `MAX_BOOTSTRAP_MAX_ITEMS = 200`
+* Receipt retention: v0 recommended
+
+  * keep receipts for **30–90 days** (configurable), or archive externally
+* Task retention: v0 recommended
+
+  * keep terminal tasks for **7–30 days** (configurable), or until explicitly pruned
+
+---
+
+## 19.2 Identity + Security Defaults (v0 practical)
+
+You can tighten later; keep the demo clean but not reckless.
+
+### Principal identity fields
+
+* Required: `principal_kind`, `principal_id`
+* Optional: `principal_instance_id`
+
+### Auth modes (choose one for v0)
+
+* **Mode A (recommended):** simple shared token for REST + MCP
+
+  * `ASYNCGATE_API_KEY` required
+  * MCP clients send it as a header/metadata field (implementation-specific)
+* **Mode B:** allow unauthenticated in dev (`ALLOW_INSECURE_DEV=true`) with loud warnings in logs
+
+### Worker identity
+
+* `worker_id` required and must be stable per worker deployment
+* `worker_instance_id` optional (useful for ephemeral scaling)
+
+---
+
+## 19.3 Task Creation Defaults
+
+When a TASKER creates a task without specifying fields:
+
+* `status = queued`
+* `attempt = 0`
+* `max_attempts = DEFAULT_MAX_ATTEMPTS`
+* `retry_backoff_seconds = DEFAULT_RETRY_BACKOFF_SECONDS`
+* `priority = DEFAULT_PRIORITY`
+* `requirements = {}` (no capability requirements)
+* `next_eligible_at = now` (immediately eligible) unless `delay_seconds` provided
+
+### Delay / scheduled eligibility
+
+If `delay_seconds` provided:
+
+* `next_eligible_at = now + delay_seconds`
+* Task remains `queued` but ineligible until that time
+
+---
+
+## 19.4 Lease Claim Defaults
+
+If a TASKEE calls `lease_next`/`/leases/claim` without specifying:
+
+* `max_tasks = 1`
+* `lease_ttl_seconds = DEFAULT_LEASE_TTL_SECONDS` (clamped to MAX)
+* `accept_types` absent means “any type”
+* `capabilities` absent means empty set
+
+---
+
+## 19.5 Capability Matching Defaults (v0)
+
+* Task may specify `requirements.capabilities: [str]`
+* Worker provides `capabilities: [str]`
+* Match rule: **all required capabilities must be present**
+  `set(requirements) ⊆ set(worker_capabilities)`
+
+If task has no required capabilities, any worker may claim it.
+
+---
+
+## 19.6 Receipt Emission Defaults (v0)
+
+Receipt emission is ON by default for major lifecycle events.
+
+### Emit on:
+
+* Task created → `task.created` (optional alias of `task.assigned`; choose one naming scheme)
+* Lease claimed → `task.accepted`
+* Progress update → `task.progress` *(if progress enabled)*
+* Completion → `task.completed` then `task.result_ready` to task owner
+* Failure → `task.failed` then `task.result_ready` to task owner
+* Lease expiry/requeue → `lease.expired` (to task owner)
+
+### Task ownership for result delivery
+
+A task must carry an owner principal:
+
+* `created_by: {principal_kind, principal_id}` captured at creation time
+* `task.result_ready` is addressed to `created_by` by default
+
+If `created_by` is absent (should not be in normal usage):
+
+* emit result to a configured fallback inbox:
+
+  * `DEFAULT_FALLBACK_OWNER_KIND = "system"`
+  * `DEFAULT_FALLBACK_OWNER_ID = "asyncgate"`
+
+---
+
+## 19.7 Sweep + Maintenance Defaults
+
+AsyncGate runs internal maintenance loops (DB-based, not worker polling):
+
+1. **Lease Expiry Sweep** (every `LEASE_SWEEP_INTERVAL_SECONDS`)
+
+* find active leases with `expires_at < now`
+* transition task to `queued`
+* clear lease
+* optionally increment attempt only when worker had started (v0 can increment on any expiry for simplicity)
+* emit `lease.expired` receipt to owner
+
+2. **Eligibility Sweep** (optional)
+   Not required if `lease_next` query filters on `next_eligible_at`. No state mutation needed.
+
+3. **Retention / Pruning** (manual or scheduled)
+
+* do NOT auto-delete by default in v0
+* provide an admin command or endpoint later
+
+---
+
+## 19.8 Recommended v0 Values for Fly.io Demo
+
+If you need a concrete config for the prototype:
+
+* `DEFAULT_LEASE_TTL_SECONDS=120` *(2 min; makes demos snappy)*
+* `LEASE_SWEEP_INTERVAL_SECONDS=5`
+* `DEFAULT_MAX_ATTEMPTS=2`
+* `DEFAULT_RETRY_BACKOFF_SECONDS=15`
+* `DEFAULT_BOOTSTRAP_MAX_ITEMS=50`
+
+---
+
+## 19.9 Naming + Compatibility Notes
+
+* Keep operation names stable; version the API when changing semantics.
+* Prefer additive changes (new fields/receipts) over breaking ones.
+* Receipts are append-only; if schema evolves, store version in receipt body:
+
+  * `body.schema_version = "1"` (or similar)
+
+
+---
+
+# 20) Dual-Mode Operation: Standalone vs. MemoryGate-Integrated
+
+## 20.1 Architecture Philosophy
+
+AsyncGate can operate in two modes, balancing deployment simplicity with LegiVellum coordination requirements:
+
+**Mode 1: Standalone** — AsyncGate maintains its own complete database (tasks, leases, receipts)
+**Mode 2: MemoryGate-Integrated** — AsyncGate maintains operational state (tasks/leases) locally but uses MemoryGate as canonical receipt ledger
+
+This preserves AsyncGate's core purpose (durable async execution) while enabling LegiVellum's coordination vision (receipts as universal primitive across all components).
+
+---
+
+## 20.2 Configuration
+
+Mode determined by startup configuration:
+
+### Standalone Mode (default)
+```yaml
+receipt_mode: standalone
+database:
+  url: postgresql://asyncgate:pass@localhost/asyncgate
+  tasks: asyncgate.db
+  leases: asyncgate.db  
+  receipts: asyncgate.db
+```
+
+### MemoryGate-Integrated Mode
+```yaml
+receipt_mode: memorygate_integrated
+database:
+  url: postgresql://asyncgate:pass@localhost/asyncgate
+  tasks: asyncgate.db       # local operational store
+  leases: asyncgate.db      # local operational store
+  receipts: memorygate      # canonical receipt ledger
+  
+memorygate:
+  url: https://memorygate.local
+  auth_token_env: MEMORYGATE_TOKEN
+  tenant_id: ${TENANT_ID}
+  emission_retry:
+    buffer_size: 10000
+    retry_interval_seconds: 30
+    max_retries: 10
+```
+
+---
+
+## 20.3 Standalone Mode Behavior
+
+### Storage
+- Tasks, leases, receipts all in AsyncGate's local database
+- Full CRUD authority over all entities
+- No external dependencies
+
+### Receipt Emission
+- AsyncGate writes receipts to its own `receipts` table
+- Bootstrap queries local receipt table
+- Receipt retention/archival handled locally
+
+### Use Cases
+- Single-component deployment
+- Testing and development
+- Edge deployments without network dependencies
+- Simple task execution without cross-system coordination
+
+---
+
+## 20.4 MemoryGate-Integrated Mode Behavior
+
+### Storage Architecture
+- **Tasks and leases in AsyncGate local DB** (performance-critical operational data)
+- **Receipts in MemoryGate** (canonical audit ledger)
+- AsyncGate never writes receipts locally in this mode
+
+### Receipt Emission Flow
+1. AsyncGate commits task state locally (authoritative)
+2. AsyncGate emits receipt by calling MemoryGate's `store_receipt` API
+3. Workers emit receipts directly to MemoryGate (not through AsyncGate)
+4. Receipt routing configured via AsyncGate's bootstrap response
+
+### Bootstrap Changes
+- AsyncGate queries MemoryGate for receipts via `list_receipts(to_id=agent_id)`
+- Task state derived from local DB
+- Receipts fetched from MemoryGate
+- Returns `receipt_routing` configuration to agents/workers
+
+### State Reconstruction
+- AsyncGate can rebuild operational state by replaying receipts from MemoryGate
+- Useful for:
+  - Disaster recovery
+  - Audit verification
+  - Migrating AsyncGate instances
+  - Validating state consistency
+
+### Use Cases
+- Production LegiVellum deployments
+- Multi-component coordination (AsyncGate + DeleGate + agents)
+- Centralized observability across all system components
+- Durable audit trail requirements
+- Cross-system causality tracing
+
+---
+
+## 20.5 Receipt Routing Protocol
+
+In MemoryGate-integrated mode, workers need to know where to send receipts.
+
+### Bootstrap Response Enhancement (Integrated Mode)
+
+```json
+{
+  "server": {
+    "name": "AsyncGate",
+    "version": "0.1.0",
+    "instance_id": "asyncgate-1",
+    "uptime": 3600,
+    "environment": "production"
+  },
+  "relationship": {...},
+  "receipt_routing": {
+    "mode": "memorygate_integrated",
+    "memorygate_url": "https://memorygate.local",
+    "auth_token": "<worker_token>",
+    "emit_receipts_to": "memorygate",
+    "worker_must_emit_to_memorygate": true
+  },
+  "attention": {...},
+  "cursor": {...}
+}
+```
+
+### Worker Responsibilities (Integrated Mode)
+
+1. Call `asyncgate.lease_next` to claim work
+2. Execute work
+3. Call `memorygate.store_receipt` with `task.completed` / `task.failed` receipt
+4. Receipt emission is idempotent (MemoryGate handles deduplication)
+
+### AsyncGate Responsibilities (Integrated Mode)
+
+1. Emit system receipts (`lease.expired`, `system.anomaly`) to MemoryGate
+2. Query MemoryGate for receipts when serving bootstrap requests
+3. Never store receipts locally
+4. Handle receipt emission failures gracefully (see failure modes below)
+
+---
+
+## 20.6 Performance Architecture Rationale
+
+### Why Keep Tasks/Leases Local in Integrated Mode?
+
+Lease claiming requires:
+- Atomic `UPDATE WHERE status=queued`
+- Sub-100ms latency for worker polling
+- Frequent renewal operations (every 30-300 seconds)
+
+Storing tasks/leases in MemoryGate would:
+- Add network hop to every lease operation
+- Introduce distributed transaction complexity
+- Couple operational performance to MemoryGate availability
+
+### Design Decision
+
+**Tasks/leases = AsyncGate's operational hot path**
+**Receipts = MemoryGate's durable cold path**
+
+### Consistency Model
+
+Task state is **eventually consistent** with receipt ledger. Reconciliation happens via:
+- Lease expiry sweep (AsyncGate emits `lease.expired` receipt)
+- Periodic audit comparing AsyncGate state to MemoryGate receipts
+- On-demand reconstruction from receipt replay
+
+---
+
+## 20.7 Receipt Schema Extension (Integrated Mode)
+
+Receipts must route correctly in multi-instance deployments. Extended receipt schema:
+
+```json
+{
+  "receipt_id": "uuid",
+  "receipt_type": "task.completed",
+  "created_at": "timestamp",
+  "from": {"kind": "worker", "id": "worker-123"},
+  "to": {"kind": "asyncgate", "id": "asyncgate-1"},
+  "task_id": "uuid",
+  "lease_id": "uuid",
+  "asyncgate_instance": "asyncgate-1",  // NEW: which AsyncGate instance owns this task
+  "body": {...}
+}
+```
+
+This enables:
+- MemoryGate to route receipts to correct AsyncGate instance
+- Audit queries to trace which AsyncGate handled which tasks
+- Cross-instance state reconstruction
+- Multi-instance coordination
+
+---
+
+## 20.8 Bootstrap Behavior Matrix
+
+| Mode | Receipt Source | Task Source | Workers Emit To | Agent Queries |
+|------|---------------|-------------|-----------------|---------------|
+| Standalone | AsyncGate DB | AsyncGate DB | AsyncGate | AsyncGate |
+| Integrated | MemoryGate | AsyncGate DB | MemoryGate | AsyncGate (aggregates from both) |
+
+**Agent experience is identical** — bootstrap returns unified attention view regardless of mode.
+
+---
+
+## 20.9 Migration Path
+
+### Standalone → Integrated
+
+1. Export receipts from AsyncGate DB
+2. Import to MemoryGate via bulk `store_receipt`
+3. Update AsyncGate config to `memorygate_integrated`
+4. Restart AsyncGate
+5. Workers auto-discover new routing via next bootstrap
+
+### Integrated → Standalone
+
+1. Query MemoryGate for all receipts where `asyncgate_instance = <this-instance>`
+2. Import to local AsyncGate `receipts` table
+3. Update config to `standalone`
+4. Restart AsyncGate
+
+**Data integrity:** Both directions preserve full receipt chain if executed correctly.
+
+---
+
+## 20.10 Failure Modes & Resilience
+
+### MemoryGate Unavailable in Integrated Mode
+
+**Option A (Recommended): Graceful Degradation**
+
+- AsyncGate continues task/lease operations normally
+- Receipt emission failures logged but don't block operations
+- Receipts queued locally in retry buffer
+- Background process retries emission to MemoryGate
+- Bootstrap returns warning: `"receipt_ledger_lag": "<N> receipts pending"`
+
+**Option B: Strict Consistency**
+
+- Task transitions fail if receipt emission fails
+- Prevents receipt-state divergence
+- High availability coupling (AsyncGate downtime = MemoryGate downtime)
+
+**v0 Recommendation:** Option A for operational resilience. Receipts are audit/observability, not operational necessity.
+
+### Receipt Buffer Overflow
+
+If retry buffer exceeds configured size:
+- Emit `system.anomaly` receipt (if MemoryGate becomes available)
+- Log critical warning
+- Oldest receipts may be persisted to disk/archived
+- System continues operating (task execution not blocked)
+
+### Network Partition
+
+During partition:
+- AsyncGate operates standalone mode implicitly
+- Receipt buffer grows
+- Once partition heals, buffer drains to MemoryGate
+- Eventual consistency restored
+
+---
+
+## 20.11 API Additions
+
+### New MCP Tool: `asyncgate.get_config`
+
+Returns operational configuration to callers.
+
+**Input:** None
+
+**Output:**
+```json
+{
+  "receipt_mode": "memorygate_integrated",
+  "memorygate_url": "https://memorygate.local",
+  "instance_id": "asyncgate-1",
+  "capabilities": ["lease_based_execution", "receipt_emission"],
+  "version": "0.1.0"
+}
+```
+
+### New REST Endpoint: `GET /v1/config`
+
+Returns same schema as MCP tool.
+
+**Use cases:**
+- Workers discovering operational mode
+- Monitoring systems checking configuration
+- Debugging deployment issues
+
+---
+
+## 20.12 Receipt Emission Semantics (Integrated Mode)
+
+### Emission Flow
+
+1. **AsyncGate commits task state locally** (transaction completes)
+2. **AsyncGate calls MemoryGate** `POST /v1/receipts` with receipt payload
+3. **MemoryGate responds** with receipt_id or error
+4. **If emission fails:**
+   - Task state is NOT rolled back (state is authoritative)
+   - Receipt is queued for retry
+   - System continues operating
+
+**Critical principle:** State > Receipt > Delivery
+
+Task state transitions are never blocked by receipt delivery failures.
+
+### Timeout Configuration
+
+```yaml
+memorygate:
+  emission_timeout_ms: 500
+  failure_mode: "eventual"  # or "strict"
+```
+
+---
+
+## 20.13 Cross-System Receipt Visibility
+
+In MemoryGate-integrated mode, all LegiVellum components share one receipt ledger:
+
+- **AsyncGate** emits task execution receipts
+- **DeleGate** emits planning receipts
+- **Agents** can query across all components
+- **MemoryGate** provides unified timeline
+
+### Query Pattern Example
+
+Agent wants to understand full workflow:
+1. Calls `memorygate.list_receipts(task_id=X)`
+2. Receives receipts from AsyncGate (execution), DeleGate (planning), other agents (collaboration)
+3. Reconstructs complete causality chain via `parents` field
+
+This enables **cross-system observability** without coupling operational systems.
+
+---
+
+## 20.14 Configuration Example (Complete)
+
+```yaml
+# config.yaml
+asyncgate:
+  instance_id: asyncgate-1
+  
+  receipt_mode: memorygate_integrated  # or 'standalone'
+  
+  database:
+    url: postgresql://asyncgate:pass@localhost/asyncgate
+    pool_size: 20
+    
+  memorygate:  # only used if receipt_mode = memorygate_integrated
+    url: https://memorygate.local
+    auth_token_env: MEMORYGATE_TOKEN
+    tenant_id: tenant-123
+    emission_timeout_ms: 500
+    emission_retry:
+      buffer_size: 10000
+      retry_interval_seconds: 30
+      max_retries: 10
+      
+  worker_bootstrap:
+    include_memorygate_routing: true  # add receipt_routing to bootstrap
+    
+  # Failure mode: "eventual" (default) or "strict"
+  receipt_consistency_mode: eventual
+```
+
+---
+
+## 20.15 Summary: Mode Selection Guide
+
+### Choose Standalone Mode When:
+- Single AsyncGate deployment
+- Testing/development environments
+- No need for cross-system coordination
+- Minimizing external dependencies
+- Edge deployments with intermittent connectivity
+
+### Choose Integrated Mode When:
+- Production LegiVellum deployments
+- Multiple coordination components (AsyncGate + DeleGate + others)
+- Centralized observability requirements
+- Audit trail durability requirements
+- Cross-system causality tracing
+- Multi-tenant isolation via MemoryGate
+
+**Default recommendation:** Start with standalone for development, migrate to integrated for production.
+
+
+---
+
+# AsyncGate Spec Hardening Addendum (v0.2)
+
+This addendum resolves ownership, causality, idempotency, scheduler behavior, receipt routing, anomaly semantics, and bootstrap attention rules. These decisions are normative and required for v0 implementation.
+
+---
+
+## H.1 Task Ownership — RESOLVED
+
+### Decision
+
+**Task ownership is immutable and authoritative.**
+
+- `created_by` is set at task creation and **never changes**
+- Ownership **does not transfer implicitly**
+- Receipts provide *audit*, not authority
+
+### Rule
+
+```text
+Task.owner := created_by at creation time (immutable)
+Receipts do NOT modify ownership
+```
+
+### Optional (Future)
+
+If ownership transfer is ever required, it MUST be explicit via:
+- New receipt type: `task.transferred`
+- Server-side validation
+- Explicit update to `task.owner`
+
+**v0:** Ownership transfer is **not supported**.
+
+---
+
+## H.2 Receipt Causality Enforcement — CLARIFIED
+
+### Authoritative Source of Truth
+
+**The state machine is authoritative. Receipts are proofs emitted by valid transitions.**
+
+> Receipts do not drive state; state drives receipts.
+
+### Enforcement Rules
+
+#### `task.accepted`
+
+Valid only if:
+- Task exists
+- `task.status ∈ {queued}`
+- Lease was atomically created for this worker
+
+#### `task.completed` / `task.failed`
+
+Valid only if:
+- `task.status ∈ {leased, running}`
+- `lease_id` matches active lease
+- `worker_id` matches lease owner
+
+#### Invalid Sequences
+
+- A receipt that violates state rules is **rejected**
+- An anomaly receipt MAY be emitted
+
+### Summary
+
+```text
+State transition → receipt emitted
+Receipt without valid transition → reject + anomaly
+```
+
+---
+
+## H.3 Receipt Idempotency Boundary — DEFINED
+
+### Decision
+
+**Receipts are idempotent at emit-time.**
+
+AsyncGate MUST dedupe receipt emission using a **receipt_key**.
+
+### Receipt Key Definition
+
+```text
+receipt_key = hash(
+  receipt_type,
+  task_id,
+  from.principal_kind,
+  from.principal_id,
+  lease_id (if present)
+)
+```
+
+### Behavior
+
+If the same logical receipt is emitted twice:
+- Return the original `receipt_id`
+- Do NOT emit a duplicate receipt
+
+This applies to:
+- `task.completed`
+- `task.failed`
+- `task.accepted`
+
+This guarantees:
+- Retries don't inflate receipt chains
+- Receipts remain proof, not spam
+
+---
+
+## H.4 Lease Renewal During Backoff — RESOLVED
+
+### Invariant (Added)
+
+```text
+Lease renewal requires:
+- Lease is active
+- task.status ∈ {leased, running}
+```
+
+### Behavior
+
+If a task has failed and been requeued with backoff:
+
+Any `renew_lease()` using the old lease_id:
+- Is rejected with error: `LEASE_INVALID_OR_EXPIRED`
+- No state mutation
+- Optional anomaly receipt if repeated
+
+This cleanly separates attempts.
+
+---
+
+## H.5 Scheduler Misfire Handling — SPECIFIED
+
+### Detection Rule
+
+Misfires are detected **on scheduler startup and on every scheduler tick**.
+
+### Canonical Misfire Detection
+
+```python
+def detect_misfires(schedule, now):
+    expected = expected_run_times(
+        last_run_at=schedule.last_run_at,
+        until=now,
+        interval=schedule.interval
+    )
+    return expected[:-1]  # exclude current tick
+```
+
+### Policy Handling
+
+- `skip`: Do nothing
+- `catch_up_one`: Enqueue task for most recent missed run
+- `catch_up_all`: Enqueue tasks for all missed runs
+
+### Idempotency
+
+Each run uses:
+
+```text
+idempotency_key = f"schedule:{schedule_id}:{run_at_iso}"
+```
+
+Scheduler restarts are safe.
+
+---
+
+## H.6 Receipt Routing with MemoryGate — CLARIFIED
+
+### Decision
+
+**AsyncGate is the receipt author. MemoryGate is the receipt store (when integrated).**
+
+### v0 Behavior (Standalone)
+
+- Receipts stored in AsyncGate DB
+- Bootstrap and list_receipts read from local store
+
+### LegiVellum Integration Mode
+
+AsyncGate is configured with:
+
+```yaml
+memorygate:
+  url: https://memorygate/v1/receipts
+  timeout_ms: 500
+  failure_mode: "eventual"
+```
+
+### Emission Semantics
+
+AsyncGate:
+- Commits task state locally
+- Then POSTs receipt to MemoryGate
+
+If MemoryGate write fails:
+- Task state is NOT rolled back
+- Receipt is retried asynchronously
+- `system.anomaly` MAY be emitted if backlog grows
+
+**State > Receipt > Delivery**
+
+---
+
+## H.7 Anomaly Receipt Semantics — DEFINED
+
+### Who Emits Anomalies
+
+- AsyncGate internal monitors ONLY (v0)
+- Workers may *trigger* anomalies indirectly via failures
+
+### v0 Anomaly Triggers
+
+AsyncGate MUST emit `system.anomaly` when:
+
+1. `task.attempt >= max_attempts` and task still queued
+2. Task requeued > **3 times** due to lease expiry
+3. Lease renewed > **10 times** without completion
+4. Scheduler enabled AND `now > next_run_at + 2*interval`
+5. Receipt emission backlog exceeds threshold (integration mode)
+
+### Anomaly Is Informational
+
+- Does NOT mutate task state
+- Delivered via bootstrap attention
+
+---
+
+## H.8 Bootstrap `waiting_results` — RESOLVED
+
+### Decision
+
+**Receipts have `delivered_at`. Acks are optional.**
+
+### Rules
+
+- `delivered_at` is set when receipt is returned in bootstrap
+- `ack_receipt()` emits a `receipt.acknowledged` receipt (audit only)
+- Attention logic uses delivery, not ack
+
+### Definition
+
+```text
+waiting_results =
+  terminal tasks with task.result_ready receipt
+  AND delivered_at IS NULL
+```
+
+Agents that never ack still clear attention naturally.
+
+---
+
+## H.9 Protocol Symmetry — ENFORCEMENT ADDED
+
+### Required Test Invariants
+
+Implement a **protocol equivalence test suite**:
+
+1. MCP and REST operations produce identical:
+   - Task state
+   - Receipt chains (modulo timestamps)
+2. Receipt hashes match across protocols
+3. Error codes map 1:1
+4. No state transition exists in only one protocol
+
+This is **non-optional** for v0 acceptance.
+
+---
+
+## H.10 Storage Atomicity — ACCEPTED
+
+### PostgreSQL (Recommended)
+
+- Use `UPDATE ... WHERE status='queued' ... RETURNING`
+- Prefer `SELECT ... FOR UPDATE SKIP LOCKED` for multi-worker scaling
+
+### SQLite
+
+- Use `BEGIN IMMEDIATE`
+- Accept lower throughput for dev/demo
+
+**Spec recommendation:** PostgreSQL for any concurrent worker scenario.
+
+---
+
+## H.11 Receipt Retention & Archival — ADDED
+
+### Default Policy (v0)
+
+- Active receipts: **30 days**
+- Archive receipts:
+  - After task terminal + 7 days
+  - Move to cold storage
+  - Maintain `receipt_id → archive_pointer`
+- Bootstrap never returns archived receipts
+
+Explicit archive query required.
+
+---
+
+## H.12 Final Clarification (Most Important)
+
+> **Receipts are proof of obligation and fulfillment — not an event log and not a reconstruction source.**
+
+- State machine is authoritative
+- Receipts are immutable attestations
+- MemoryGate is the long-term memory
+- AsyncGate is the arbiter of truth
+
+**The lattice sings because the invariants are now explicit.**
+
+At this point, v0 semantics are frozen and ready for implementation + invariant tests. The spec has crossed the line from "clever" to **durable**.
+
+
+---
+
+# Clarifications and Disambiguation (v0.2 Amendments)
+
+The following critical clarifications strengthen the specification's precision:
+
+## Clarification A: Task Ownership Invariant
+
+**Addition to Section 3 (Core Data Model - Task) and Section H.1 (Hardening Addendum):**
+
+**Invariant:** At any time, exactly one principal is the authoritative owner of a task, defined by `created_by`. No other receipt or operation may change this field.
+
+This applies throughout the specification wherever task ownership is referenced.
+
+## Clarification B: Receipt Hash Semantics
+
+**Addition to Section 13 (Receipt Fields - hash field):**
+
+The `hash` field is computed over the canonical receipt payload excluding delivery metadata (such as `delivered_at`) and timestamps. It is used for deduplication and equivalence checks, **not cryptographic verification** or authentication.
+
+This clarifies that hash collisions are acceptable for audit purposes and that cryptographic strength is not required for v0.
+
+## Clarification C: Lease Expiry Sweep Instance Ownership
+
+**Addition to Section 15 (Lease expiry handling):**
+
+**Instance Ownership:** Only the AsyncGate instance identified by `asyncgate_instance` may perform lease expiry sweeps for tasks it owns. In multi-instance deployments, task ownership is partitioned by instance.
+
+**Addition to Section 20.7 (Receipt Schema Extension - asyncgate_instance field):**
+
+The `asyncgate_instance` field in receipts identifies which AsyncGate instance has authority over lease expiry sweeps for the associated task. This prevents race conditions in multi-instance deployments where multiple AsyncGate servers might attempt to expire the same lease.
+
+---
+
+These clarifications are normative for v0.2 and resolve ambiguities that could lead to implementation divergence or operational issues in multi-instance scenarios.
+
+
+---
+
+# 21) Security, Authentication & Rate Limiting
+
+## 21.1 Security Philosophy
+
+AsyncGate is a publicly-accessible MCP server requiring defense in depth:
+
+1. **Authentication** — Verify principal identity
+2. **Authorization** — Control what authenticated principals can do
+3. **Multi-tenancy** — Isolate tenants from each other
+4. **Rate limiting** — Prevent abuse and runaway costs
+5. **Audit logging** — Track security-relevant events
+
+**Threat Model:** AsyncGate must protect against:
+- Unauthorized access (credential theft, token leakage)
+- Cross-tenant access (tenant isolation violations)
+- Resource exhaustion (DDoS, cost attacks)
+- Task injection (malicious task creation)
+- Receipt forgery (invalid state transitions)
+
+---
+
+## 21.2 Authentication Mechanisms
+
+AsyncGate supports two authentication modes:
+
+### 21.2.1 OAuth 2.0 (Human Agents / Interactive Clients)
+
+**Grant Type:** Authorization Code with PKCE (RFC 7636)
+
+**Flow:**
+1. Client redirects user to `/oauth/authorize`
+2. User authenticates with identity provider (Google, GitHub, etc.)
+3. AsyncGate redirects back with authorization code
+4. Client exchanges code for access token at `/oauth/token`
+5. Client uses access token for subsequent API calls
+
+**Token Format:** JWT (JSON Web Token)
+
+**JWT Claims (minimum):**
+```json
+{
+  "sub": "user-uuid",
+  "tenant_id": "tenant-uuid",
+  "principal_kind": "agent",
+  "principal_id": "agent-name",
+  "exp": 1234567890,
+  "iat": 1234567890,
+  "iss": "asyncgate",
+  "aud": "asyncgate-api"
+}
+```
+
+**Token Expiry:**
+- Access tokens: User-configurable, 5-90 days (default 30)
+- Refresh tokens: 90 days
+- Token rotation on refresh
+
+**Security Requirements:**
+- Redirect URI allowlisting (MUST match registered URIs exactly)
+- State parameter for CSRF protection
+- PKCE code_challenge for authorization code interception protection
+- Secure token storage (httpOnly cookies or secure storage APIs)
+
+### 21.2.2 API Keys (Service-to-Service / Workers)
+
+**Format:** `aga_<random-base62>` (32+ characters)
+
+**Scope:** API keys are tied to:
+- Tenant ID
+- Principal (agent or worker)
+- Capabilities (optional scope restrictions)
+
+**Storage:** Hashed with Argon2id before database storage
+
+**Rotation:** Keys can be rotated without downtime via overlapping validity periods
+
+**Header Format:**
+```
+Authorization: Bearer aga_xyz123...
+```
+
+**Key Creation:** Via admin API or customer portal
+
+---
+
+## 21.3 Multi-Tenant Isolation
+
+### 21.3.1 Tenant Model
+
+**Tenant:** A boundary of data isolation. Each tenant has:
+- Unique `tenant_id` (UUID)
+- Independent task/lease/receipt namespaces
+- Separate rate limit buckets
+- Independent billing accounts
+
+**Tenant Extraction:**
+- OAuth: `tenant_id` from JWT claim
+- API Key: `tenant_id` from key→tenant mapping
+- Never trust client-provided tenant_id
+
+### 21.3.2 Database Isolation
+
+All tables include `tenant_id` as leading column in primary key and indexes:
+
+```sql
+CREATE TABLE tasks (
+  tenant_id UUID NOT NULL,
+  task_id UUID NOT NULL,
+  ...
+  PRIMARY KEY (tenant_id, task_id)
+);
+
+CREATE INDEX idx_tasks_tenant_status ON tasks (tenant_id, status, created_at);
+```
+
+**Query Enforcement:**
+All queries MUST include `WHERE tenant_id = :tenant_id` filter.
+
+**Row-Level Security (RLS):**
+PostgreSQL RLS policies enforce tenant isolation at database level:
+
+```sql
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_setting('app.tenant_id')::uuid);
+```
+
+### 21.3.3 Receipt Isolation
+
+Receipts include `tenant_id` field. Cross-tenant receipt access is impossible:
+
+```json
+{
+  "receipt_id": "uuid",
+  "tenant_id": "tenant-uuid",
+  "receipt_type": "task.completed",
+  ...
+}
+```
+
+Composite unique constraint prevents ID collisions:
+```sql
+UNIQUE (tenant_id, receipt_id)
+```
+
+---
+
+## 21.4 Rate Limiting (Critical for Cost Control)
+
+### 21.4.1 Rate Limit Architecture
+
+**Three-Tier Limits:**
+
+1. **Global Limits** (server-wide, prevents infrastructure overload)
+2. **Tenant Limits** (per-tenant quotas)
+3. **Principal Limits** (per-agent/worker within tenant)
+
+**Storage:** Redis for distributed rate limiting
+
+**Algorithm:** Token bucket with sliding window
+
+### 21.4.2 Rate Limit Tiers
+
+**Free Tier:**
+- 100 tasks/hour per tenant
+- 10 concurrent leases per tenant
+- 1,000 API calls/hour per tenant
+- 1 GB receipt storage
+
+**Paid Tier:**
+- 10,000 tasks/hour per tenant (configurable)
+- 100 concurrent leases per tenant
+- 100,000 API calls/hour per tenant
+- 10 GB receipt storage
+
+**Enterprise Tier:**
+- Unlimited (subject to fair use)
+- Dedicated instances available
+
+### 21.4.3 Rate Limit Headers
+
+All responses include rate limit headers:
+
+```
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 847
+X-RateLimit-Reset: 1234567890
+X-RateLimit-Bucket: tenant:abc-123:api_calls
+```
+
+### 21.4.4 Rate Limit Exceeded Response
+
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Tenant API call limit exceeded (1000/hour)",
+  "retry_after": 3600,
+  "limit": 1000,
+  "window": "1h"
+}
+```
+
+HTTP Status: `429 Too Many Requests`
+
+### 21.4.5 Rate Limit Bypass (Enterprise)
+
+Enterprise tenants can request rate limit exemptions via support ticket.
+
+Bypass documented in audit log:
+```json
+{
+  "event": "rate_limit_bypass_granted",
+  "tenant_id": "uuid",
+  "reason": "Enterprise contract clause 3.2",
+  "approved_by": "admin-user-id",
+  "expires_at": "timestamp"
+}
+```
+
+---
+
+## 21.5 Authorization Model
+
+### 21.5.1 Principal Roles
+
+**Agent Role:**
+- Create tasks
+- Query own tasks
+- Cancel own tasks
+- Receive results
+- Read own receipts
+
+**Worker Role:**
+- Lease tasks (matching capabilities)
+- Renew leases
+- Complete/fail tasks
+- Emit receipts
+
+**Admin Role:**
+- All agent permissions
+- All worker permissions
+- Query any task in tenant
+- Cancel any task in tenant
+- View audit logs
+
+**System Role:**
+- Internal AsyncGate operations only
+- Lease expiry sweeps
+- Anomaly detection
+- System receipts
+
+### 21.5.2 Permission Matrix
+
+| Operation | Agent | Worker | Admin | System |
+|-----------|-------|--------|-------|--------|
+| create_task | ✓ | ✗ | ✓ | ✓ |
+| get_task (own) | ✓ | ✓ | ✓ | ✓ |
+| get_task (any) | ✗ | ✗ | ✓ | ✓ |
+| list_tasks (own) | ✓ | ✗ | ✓ | ✓ |
+| list_tasks (any) | ✗ | ✗ | ✓ | ✓ |
+| cancel_task (own) | ✓ | ✗ | ✓ | ✓ |
+| cancel_task (any) | ✗ | ✗ | ✓ | ✓ |
+| lease_next | ✗ | ✓ | ✓ | ✗ |
+| renew_lease | ✗ | ✓ | ✓ | ✗ |
+| complete | ✗ | ✓ | ✓ | ✗ |
+| fail | ✗ | ✓ | ✓ | ✗ |
+| list_receipts (own) | ✓ | ✓ | ✓ | ✓ |
+| list_receipts (any) | ✗ | ✗ | ✓ | ✓ |
+| view_audit_log | ✗ | ✗ | ✓ | ✓ |
+
+### 21.5.3 Authorization Checks
+
+Every operation MUST:
+
+1. Extract `tenant_id` from auth token
+2. Extract `principal_kind` and `principal_id`
+3. Check role permissions
+4. Check task ownership (for task-specific operations)
+5. Log authorization decision
+
+**Authorization Failure Response:**
+
+```json
+{
+  "error": "forbidden",
+  "message": "Worker principals cannot cancel tasks",
+  "required_role": "agent",
+  "your_role": "worker"
+}
+```
+
+HTTP Status: `403 Forbidden`
+
+---
+
+## 21.6 Cost Controls & Quotas
+
+### 21.6.1 Task Quotas
+
+**Per-Tenant Limits:**
+- Max active tasks (queued + leased + running)
+- Max terminal tasks (retention period)
+- Max task payload size (default 1MB)
+
+**Enforcement:**
+- `create_task` checks active task count
+- Returns `quota_exceeded` error if limit reached
+- Terminal tasks auto-archived after retention period
+
+### 21.6.2 Lease Quotas
+
+**Per-Tenant Limits:**
+- Max concurrent leases
+- Max lease TTL (prevents infinite leases)
+
+**Enforcement:**
+- `lease_next` checks concurrent lease count
+- Returns empty result if quota reached
+- `renew_lease` clamps TTL to max
+
+### 21.6.3 Receipt Storage Quotas
+
+**Per-Tenant Limits:**
+- Max receipt storage (bytes)
+- Max receipts per task
+
+**Enforcement:**
+- Receipt emission checks storage quota
+- Oldest receipts archived when quota exceeded
+- Bootstrap returns warning if near limit
+
+### 21.6.4 Billing Integration
+
+**Usage Tracking:**
+- Tasks created (count)
+- Lease-hours consumed (duration × count)
+- Receipt storage (bytes × time)
+- API calls (count)
+
+**Metering:**
+- Asynchronous usage aggregation (every 5 minutes)
+- Written to `usage_events` table
+- Queryable via admin API
+
+**Billing Webhook:**
+- POST to configured billing endpoint
+- Payload includes usage deltas
+- Idempotent (usage_event_id deduplication)
+
+---
+
+## 21.7 Security Best Practices
+
+### 21.7.1 Transport Security
+
+**TLS Required:**
+- TLS 1.3 minimum (1.2 acceptable)
+- Strong cipher suites only
+- HSTS header: `max-age=31536000; includeSubDomains`
+
+**Certificate Validation:**
+- Valid certificate from trusted CA
+- Certificate pinning for high-security clients
+
+### 21.7.2 Token Security
+
+**Access Tokens:**
+- Never log access tokens
+- Short expiry (5-90 days, user configurable)
+- Rotate on compromise
+- httpOnly cookies for browser clients
+
+**Refresh Tokens:**
+- One-time use (invalidated on refresh)
+- Store hash only, not plaintext
+- Rotate on suspicious activity
+
+**API Keys:**
+- Generate with cryptographic RNG
+- Hash with Argon2id before storage
+- Never display after creation (show once)
+
+### 21.7.3 Input Validation
+
+**All Inputs:**
+- Validate types (JSON schema)
+- Validate lengths (prevent oversized payloads)
+- Validate formats (UUIDs, timestamps, etc.)
+- Sanitize for logging (no PII in logs)
+
+**Task Payloads:**
+- Max size: 1MB (configurable)
+- JSON structure validation
+- No executable code execution
+
+### 21.7.4 Audit Logging
+
+**Security Events (Always Logged):**
+- Authentication attempts (success/failure)
+- Authorization failures
+- Rate limit exceeded
+- Token creation/rotation/revocation
+- Admin operations
+- Quota exceeded events
+
+**Log Format:**
+```json
+{
+  "timestamp": "2026-01-05T14:00:00Z",
+  "event": "auth_failure",
+  "tenant_id": "uuid",
+  "principal_id": "agent-name",
+  "ip": "1.2.3.4",
+  "user_agent": "...",
+  "reason": "invalid_token",
+  "severity": "warning"
+}
+```
+
+**Log Retention:** 90 days minimum (compliance dependent)
+
+**Log Access:** Admin role only
+
+### 21.7.5 Secrets Management
+
+**Configuration Secrets:**
+- JWT signing key (RS256 private key)
+- Database credentials
+- OAuth client secrets
+- Webhook signing keys
+
+**Storage:**
+- Environment variables (dev/test)
+- Secrets manager (production: AWS Secrets Manager, HashiCorp Vault)
+- Never commit to git
+- Rotate quarterly
+
+---
+
+## 21.8 OAuth 2.0 Implementation Details
+
+### 21.8.1 Endpoints
+
+**Authorization Endpoint:**
+```
+GET /oauth/authorize
+  ?response_type=code
+  &client_id=<client_id>
+  &redirect_uri=<uri>
+  &state=<random>
+  &code_challenge=<pkce_challenge>
+  &code_challenge_method=S256
+  &scope=tasks:read,tasks:write,receipts:read
+```
+
+**Token Endpoint:**
+```
+POST /oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=<auth_code>
+&redirect_uri=<uri>
+&client_id=<client_id>
+&code_verifier=<pkce_verifier>
+```
+
+**Refresh Endpoint:**
+```
+POST /oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token
+&refresh_token=<refresh_token>
+&client_id=<client_id>
+```
+
+### 21.8.2 Client Registration
+
+Clients MUST be pre-registered with:
+- `client_id` (UUID)
+- `client_name` (display name)
+- `redirect_uris` (allowlist, exact match required)
+- `scopes` (permitted scopes)
+
+**Registration API:**
+```
+POST /admin/oauth/clients
+{
+  "client_name": "My Agent",
+  "redirect_uris": ["https://myapp.com/oauth/callback"],
+  "scopes": ["tasks:read", "tasks:write", "receipts:read"]
+}
+```
+
+### 21.8.3 Scope Definitions
+
+| Scope | Description | Operations |
+|-------|-------------|------------|
+| tasks:read | Read own tasks | get_task, list_tasks |
+| tasks:write | Create/cancel tasks | create_task, cancel_task |
+| tasks:lease | Lease tasks (worker) | lease_next, renew_lease, complete, fail |
+| receipts:read | Read receipts | list_receipts, get_receipt |
+| receipts:ack | Acknowledge receipts | ack_receipt |
+| admin:read | Read all tenant data | All read operations across tenant |
+| admin:write | Modify all tenant data | All operations across tenant |
+
+**Default Scopes (Agent):** `tasks:read,tasks:write,receipts:read,receipts:ack`
+
+**Default Scopes (Worker):** `tasks:lease,receipts:read`
+
+---
+
+## 21.9 Incident Response
+
+### 21.9.1 Token Compromise
+
+**Detection:**
+- Multiple failed auth attempts
+- Token use from unexpected IP/location
+- Token use after user logout
+
+**Response:**
+1. Revoke compromised token immediately
+2. Force token rotation for tenant
+3. Audit all operations with compromised token
+4. Notify tenant admin
+5. Log incident
+
+### 21.9.2 Rate Limit Abuse
+
+**Detection:**
+- Rapid API calls near rate limit
+- Suspicious task creation patterns
+- Unusual worker behavior
+
+**Response:**
+1. Apply temporary stricter rate limits
+2. Contact tenant admin
+3. Analyze abuse pattern
+4. Implement targeted throttling if intentional abuse
+
+### 21.9.3 Cross-Tenant Access Attempt
+
+**Detection:**
+- Query includes wrong tenant_id
+- Receipt references task from different tenant
+- Worker attempts lease of other tenant's task
+
+**Response:**
+1. Block request immediately (403)
+2. Log critical security event
+3. Alert security team
+4. Review tenant permissions
+5. Potential account suspension if intentional
+
+---
+
+## 21.10 Configuration
+
+### 21.10.1 Security Configuration
+
+```yaml
+security:
+  jwt:
+    algorithm: RS256
+    private_key_path: /secrets/jwt_private.pem
+    public_key_path: /secrets/jwt_public.pem
+    access_token_ttl_days: 30
+    refresh_token_ttl_days: 90
+    
+  oauth:
+    enabled: true
+    providers:
+      - name: google
+        client_id: ${GOOGLE_CLIENT_ID}
+        client_secret: ${GOOGLE_CLIENT_SECRET}
+        discovery_url: https://accounts.google.com/.well-known/openid-configuration
+        
+  api_keys:
+    hash_algorithm: argon2id
+    hash_time_cost: 2
+    hash_memory_cost: 65536
+    hash_parallelism: 1
+    
+  rate_limiting:
+    enabled: true
+    storage: redis
+    redis_url: ${REDIS_URL}
+    default_tier: free
+    
+  audit_logging:
+    enabled: true
+    retention_days: 90
+    sensitive_fields: [password, token, api_key]
+```
+
+### 21.10.2 Rate Limit Configuration
+
+```yaml
+rate_limits:
+  free_tier:
+    tasks_per_hour: 100
+    concurrent_leases: 10
+    api_calls_per_hour: 1000
+    receipt_storage_gb: 1
+    
+  paid_tier:
+    tasks_per_hour: 10000
+    concurrent_leases: 100
+    api_calls_per_hour: 100000
+    receipt_storage_gb: 10
+    
+  enterprise_tier:
+    tasks_per_hour: -1  # unlimited
+    concurrent_leases: -1
+    api_calls_per_hour: -1
+    receipt_storage_gb: -1
+```
+
+---
+
+## 21.11 Testing Requirements
+
+### 21.11.1 Security Test Suite
+
+**Authentication Tests:**
+- Valid OAuth flow completes successfully
+- Invalid redirect URI rejected
+- Missing PKCE rejected
+- Expired token rejected
+- Revoked token rejected
+
+**Authorization Tests:**
+- Agent cannot lease tasks
+- Worker cannot create tasks
+- Cross-tenant access blocked
+- Admin can access all tenant data
+
+**Rate Limiting Tests:**
+- Rate limit enforced correctly
+- Rate limit resets after window
+- Different principals have separate limits
+- 429 response on exceed
+
+**Multi-Tenancy Tests:**
+- Tenant A cannot see tenant B data
+- Task IDs can collide across tenants
+- Receipt IDs scoped to tenant
+- RLS policies enforced
+
+### 21.11.2 Penetration Testing
+
+Before production:
+- Token theft simulation
+- SQL injection attempts
+- XSS attempts (if web UI exists)
+- Rate limit bypass attempts
+- Authorization bypass attempts
+
+---
+
+## 21.12 Compliance
+
+### 21.12.1 Data Privacy
+
+**GDPR Compliance:**
+- User data export API
+- User data deletion API (right to be forgotten)
+- Data processing agreement available
+- Privacy policy published
+
+**Data Retention:**
+- Active tasks: Until terminal + retention period
+- Terminal tasks: Configurable (default 30 days)
+- Receipts: 30 days active, then archived
+- Audit logs: 90 days minimum
+
+### 21.12.2 Security Standards
+
+**SOC 2 Type II** (future):
+- Access controls documented
+- Audit logging complete
+- Incident response procedures
+- Change management process
+
+**ISO 27001** (future):
+- Information security management system
+- Risk assessments
+- Security controls
+- Continuous improvement
+
+---
+
+## 21.13 Migration Path (v0 → Secured)
+
+**Phase 1: Authentication**
+- Implement OAuth 2.0 flow
+- Implement API key system
+- Add JWT validation middleware
+
+**Phase 2: Multi-Tenancy**
+- Add tenant_id to all tables
+- Implement RLS policies
+- Add tenant extraction from auth
+
+**Phase 3: Rate Limiting**
+- Deploy Redis
+- Implement token bucket algorithm
+- Add rate limit middleware
+
+**Phase 4: Hardening**
+- Add audit logging
+- Implement quotas
+- Add security headers
+- Security testing
+
+**Phase 5: Compliance**
+- Data export API
+- Data deletion API
+- Privacy policy
+- Terms of service
+
+---
+
+## 21.14 Production Checklist
+
+Before going live:
+
+- [ ] TLS certificate valid and configured
+- [ ] OAuth redirect URIs allowlisted
+- [ ] JWT signing keys generated and secured
+- [ ] API keys hashed in database
+- [ ] Rate limiting enabled and tested
+- [ ] Multi-tenant isolation verified
+- [ ] Audit logging enabled
+- [ ] Security headers configured
+- [ ] Secrets in secrets manager (not env vars)
+- [ ] Database RLS policies enabled
+- [ ] Monitoring and alerting configured
+- [ ] Incident response plan documented
+- [ ] Privacy policy published
+- [ ] Terms of service published
+- [ ] Penetration testing completed
+- [ ] Load testing completed
+- [ ] Backup and recovery tested
+- [ ] DDoS protection configured (Cloudflare, etc.)
+
+---
+
+**Security is not optional.** Every item in this section is required for production deployment.

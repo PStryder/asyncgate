@@ -138,18 +138,17 @@ Environment variables (prefix `ASYNCGATE_`):
 ## Task Lifecycle
 
 ```
-queued -> leased -> running -> succeeded
-                  \         \-> failed -> queued (retry)
-                   \-> canceled
+queued -> leased -> succeeded
+                 \-> failed -> queued (retry)
+                  \-> canceled
 ```
 
 ### State Transitions
 
 - `queued -> leased`: Worker claims task
-- `leased -> running`: Worker starts execution (optional)
-- `leased/running -> succeeded`: Task completes successfully
-- `leased/running -> failed`: Task fails (may retry)
-- `queued/leased/running -> canceled`: Task canceled
+- `leased -> succeeded`: Task completes successfully
+- `leased -> failed`: Task fails (may retry)
+- `queued/leased -> canceled`: Task canceled
 - `failed -> queued`: Retry with backoff (if attempts remaining)
 - `leased -> queued`: Lease expires (system-driven)
 

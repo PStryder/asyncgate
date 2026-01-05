@@ -78,16 +78,10 @@ class Task(BaseModel):
         valid_transitions: dict[TaskStatus, set[TaskStatus]] = {
             TaskStatus.QUEUED: {TaskStatus.LEASED, TaskStatus.CANCELED},
             TaskStatus.LEASED: {
-                TaskStatus.RUNNING,
                 TaskStatus.SUCCEEDED,
                 TaskStatus.FAILED,
                 TaskStatus.CANCELED,
-                TaskStatus.QUEUED,  # On lease expiry
-            },
-            TaskStatus.RUNNING: {
-                TaskStatus.SUCCEEDED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELED,
+                TaskStatus.QUEUED,  # On lease expiry (system-driven)
             },
             TaskStatus.FAILED: {TaskStatus.QUEUED},  # Only if retry requeues
             TaskStatus.SUCCEEDED: set(),

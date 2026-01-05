@@ -1,0 +1,28 @@
+
+## H.1 Task Ownership — RESOLVED
+
+### Decision
+
+**Task ownership is immutable and authoritative.**
+
+- `created_by` is set at task creation and **never changes**
+- Ownership **does not transfer implicitly**
+- Receipts provide *audit*, not authority
+
+**Invariant:** At any time, exactly one principal is the authoritative owner of a task, defined by `created_by`. No other receipt or operation may change this field.
+
+### Rule
+
+```text
+Task.owner := created_by at creation time (immutable)
+Receipts do NOT modify ownership
+```
+
+### Optional (Future)
+
+If ownership transfer is ever required, it MUST be explicit via:
+- New receipt type: `task.transferred`
+- Server-side validation
+- Explicit update to `task.owner`
+
+**v0:** Ownership transfer is **not supported**.

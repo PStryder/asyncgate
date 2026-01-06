@@ -60,11 +60,8 @@ async def verify_api_key(
     in explicit insecure dev mode, all requests are rejected.
     """
     # Insecure dev mode bypass (must be explicitly enabled)
+    # Note: Startup warning is logged by validate_auth_config()
     if settings.allow_insecure_dev and settings.env == Environment.DEVELOPMENT:
-        logger.warning(
-            "INSECURE MODE ENABLED: API authentication is disabled. "
-            "Set ASYNCGATE_ALLOW_INSECURE_DEV=false for production."
-        )
         return True
 
     # SECURITY: Fail closed if api_key not configured

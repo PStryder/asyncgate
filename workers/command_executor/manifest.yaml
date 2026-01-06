@@ -1,0 +1,21 @@
+name: command_executor
+version: 1.0.0
+description: Reference worker that executes shell commands and writes output to filesystem
+
+capabilities:
+  - task_type: "command.execute"
+    schema:
+      type: object
+      properties:
+        command:
+          type: string
+          description: "Shell command to execute"
+        output_path:
+          type: string
+          description: "Filesystem path where output will be written"
+      required: [command, output_path]
+
+notes: |
+  This is a reference implementation for testing AsyncGate's coordination layer.
+  It executes commands without validation or safety checks.
+  DO NOT use in production without proper sandboxing.

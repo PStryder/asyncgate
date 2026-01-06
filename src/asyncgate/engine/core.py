@@ -664,6 +664,8 @@ class AsyncGateEngine:
                 async with self.session.begin_nested():  # SAVEPOINT
                     # 1. CRITICAL: Use requeue_on_expiry (does NOT increment attempt)
                     # Lease expiry = "lost authority", NOT "task failed"
+                    # P2-3: Lease expiry = lost authority, not failure; does not consume attempts
+                    # This distinction is critical: worker crash ≠ task failure
                     await self.tasks.requeue_on_expiry(
                         lease.tenant_id,
                         lease.task_id,

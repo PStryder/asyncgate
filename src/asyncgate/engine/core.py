@@ -606,6 +606,9 @@ class AsyncGateEngine:
         Called by background sweep task. Only processes leases for tasks
         owned by this AsyncGate instance (multi-instance safe).
         
+        CRITICAL: Uses requeue_on_expiry() which does NOT increment attempt.
+        Lease expiry is "lost authority" (worker crash), not "task failed".
+        
         Args:
             batch_size: Number of leases to process per batch (default 20).
                        Smaller batches with jittered requeue times prevent
@@ -631,27 +634,13 @@ class AsyncGateEngine:
             # This prevents all expired tasks from becoming eligible simultaneously
             jitter_seconds = random.uniform(0, 5)
             
-            # Requeue task with jittered delay
-            await self.tasks.requeue_with_backoff(
+            # CRITICAL: Use requeue_on_expiry (does NOT increment attempt)
+            # Lease expiry = "lost authority", NOT "task failed"
+            await self.tasks.requeue_on_expiry(
                 lease.tenant_id,
                 lease.task_id,
-                increment_attempt=True,
+                jitter_seconds=jitter_seconds,
             )
-            
-            # Update next_eligible_at with jitter
-            # (requeue_with_backoff sets it, we add jitter on top)
-            task = await self.tasks.get(lease.tenant_id, lease.task_id)
-            if task and task.next_eligible_at:
-                from datetime import timedelta
-                jittered_time = task.next_eligible_at + timedelta(seconds=jitter_seconds)
-                await self.session.execute(
-                    update(TaskTable)
-                    .where(
-                        TaskTable.tenant_id == lease.tenant_id,
-                        TaskTable.task_id == lease.task_id,
-                    )
-                    .values(next_eligible_at=jittered_time)
-                )
 
             # Release expired lease
             await self.leases.release(lease.tenant_id, lease.task_id)

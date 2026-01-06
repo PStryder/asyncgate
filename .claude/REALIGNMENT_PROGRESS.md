@@ -358,24 +358,60 @@ async def test_obligations_endpoint_is_unbucketed():
 
 ---
 
-## NEXT: TIER 4 - Lease/Retry Separation (CRITICAL)
+## COMPLETED: TIER 4 - Lease/Retry Separation (CRITICAL)
 
-### T4.1: Split Lease Expiry from Retry Backoff
-**File:** `src/asyncgate/db/repositories.py` (TaskRepository)
-**From Hexy:** This is a REAL footgun today
-- Lease expiry = "lost authority", NOT "task failed"
-- Burning attempt on expiry causes false terminal failure under flaky workers
-- [ ] Add `requeue_on_expiry(task_id)` method
-  - Does NOT increment `attempt`
-  - Uses minimal jitter (0-5s) instead of retry backoff
-  - Sets `status = QUEUED`
-- [ ] Keep `requeue_with_backoff(task_id, increment_attempt=True)` for failures
-- [ ] Update `AsyncGateEngine.expire_leases()` to use new method
-**Why critical:** Worker crash shouldn't eat all attempts
+### ✅ T4.1: Split Lease Expiry from Retry Backoff
+**Files:** `src/asyncgate/db/repositories.py`, `src/asyncgate/engine/core.py`
+**Status:** COMPLETE
+
+**The footgun that was fixed:**
+- Old behavior: Lease expiry incremented attempt counter
+- Problem: Worker crashes burned retry attempts → false terminal failures
+- Impact: Flaky workers could cause tasks to hit max_attempts prematurely
+
+**What was implemented:**
+
+**1. New method: `TaskRepository.requeue_on_expiry()`**
+- Location: `src/asyncgate/db/repositories.py`
+- Does NOT increment attempt counter (CRITICAL difference)
+- Uses minimal jitter (0-5s) instead of exponential backoff
+- Preserves current attempt value
+- Returns task to QUEUED status
+
+**2. Updated: `AsyncGateEngine.expire_leases()`**  
+- Location: `src/asyncgate/engine/core.py`
+- Changed from: `requeue_with_backoff(increment_attempt=True)`
+- Changed to: `requeue_on_expiry(jitter_seconds=random.uniform(0, 5))`
+- Removed complex double-jitter logic (now handled in requeue_on_expiry)
+- Added comments explaining "lost authority" vs "task failed"
+
+**3. Preserved: `TaskRepository.requeue_with_backoff()`**
+- Kept unchanged for actual task failures
+- Still used by fail_task() operations
+- Increments attempt counter (correct for real failures)
+- Uses exponential backoff
+
+**Semantic separation established:**
+
+```python
+# Lease expiry = "lost authority" (worker crash, network issue)
+# Does NOT increment attempt
+await tasks.requeue_on_expiry(tenant_id, task_id, jitter_seconds=3.0)
+
+# Task failure = "task actually failed" (error in task execution)
+# DOES increment attempt, uses exponential backoff
+await tasks.requeue_with_backoff(tenant_id, task_id, increment_attempt=True)
+```
+
+**Testing considerations (Tier 6):**
+- Verify lease expiry doesn't increment attempt
+- Verify real failures do increment attempt
+- Verify jitter prevents thundering herd
+- Verify tasks don't hit terminal state prematurely
 
 ---
 
-## TIER 5: Polish & Documentation (NOT STARTED)
+## NEXT: TIER 5 - Polish & Documentation
 
 ### T5.1: Receipt Size Limits (Make Error Message a Weapon)
 **File:** `src/asyncgate/db/repositories.py` or validation layer

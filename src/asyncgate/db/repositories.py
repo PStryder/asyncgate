@@ -233,6 +233,54 @@ class TaskRepository:
 
         return await self.get(tenant_id, task_id)
 
+    async def requeue_on_expiry(
+        self,
+        tenant_id: UUID,
+        task_id: UUID,
+        jitter_seconds: float = 0.0,
+    ) -> Task | None:
+        """
+        Requeue a task after lease expiry (lost authority, NOT task failure).
+        
+        Critical difference from requeue_with_backoff:
+        - Does NOT increment attempt counter (worker crash shouldn't eat retries)
+        - Uses minimal jitter (0-5s) instead of exponential backoff
+        - Prevents worker crashes from causing false terminal failures
+        
+        Args:
+            tenant_id: Tenant ID
+            task_id: Task ID
+            jitter_seconds: Optional jitter to add (0-5s recommended for anti-storm)
+        
+        Returns:
+            Updated task or None if not found
+        """
+        task = await self.get(tenant_id, task_id)
+        if not task:
+            return None
+
+        now = datetime.utcnow()
+        # CRITICAL: Do NOT increment attempt - lease expiry is "lost authority" not "task failed"
+        attempt = task.attempt
+        
+        # Minimal jitter instead of exponential backoff
+        next_eligible_at = now + timedelta(seconds=jitter_seconds)
+
+        values = {
+            "status": TaskStatus.QUEUED,
+            "attempt": attempt,
+            "next_eligible_at": next_eligible_at,
+            "updated_at": now,
+        }
+
+        await self.session.execute(
+            update(TaskTable)
+            .where(TaskTable.tenant_id == tenant_id, TaskTable.task_id == task_id)
+            .values(**values)
+        )
+
+        return await self.get(tenant_id, task_id)
+
     async def _get_by_idempotency_key(self, tenant_id: UUID, key: str) -> Task | None:
         """Get task by idempotency key."""
         result = await self.session.execute(

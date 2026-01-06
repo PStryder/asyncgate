@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: asyncgate-postgres
+    environment:
+      POSTGRES_USER: asyncgate
+      POSTGRES_PASSWORD: asyncgate
+      POSTGRES_DB: asyncgate
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asyncgate"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  asyncgate:
+    build: .
+    container_name: asyncgate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASYNCGATE_ENV: development
+      ASYNCGATE_DATABASE_URL: postgresql+asyncpg://asyncgate:asyncgate@postgres:5432/asyncgate
+      ASYNCGATE_API_KEY: dev-test-key-not-for-production
+      ASYNCGATE_ALLOW_INSECURE_DEV: "true"
+      ASYNCGATE_LOG_LEVEL: DEBUG
+      ASYNCGATE_CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:8080
+      ASYNCGATE_RATE_LIMIT_ENABLED: "true"
+      ASYNCGATE_RATE_LIMIT_BACKEND: memory
+    ports:
+      - "8000:8080"
+    command: >
+      sh -c "
+        echo 'Waiting for database...' &&
+        sleep 5 &&
+        echo 'Running migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting AsyncGate...' &&
+        uvicorn asyncgate.main:app --host 0.0.0.0 --port 8080 --reload
+      "
+
+volumes:
+  postgres_data:

@@ -67,8 +67,12 @@ class AsyncGateEngine:
         max_items: int | None = None,
     ) -> dict[str, Any]:
         """
-        Establish session identity and return attention-aware status packet.
-
+        DEPRECATED: Use list_open_obligations() instead.
+        
+        Legacy bootstrap with attention semantics. Simplified to remove
+        task-state queries (wrong model). Returns minimal response for
+        API compatibility while clients migrate to /v1/obligations/open.
+        
         Bootstrap is idempotent and safe to call frequently.
         """
         max_items = min(
@@ -93,45 +97,20 @@ class AsyncGateEngine:
             limit=max_items,
         )
 
-        # Mark receipts as delivered
+        # Mark receipts as delivered (telemetry only - not control logic)
         if inbox_receipts:
             receipt_ids = [r.receipt_id for r in inbox_receipts]
             await self.receipts.mark_delivered(tenant_id, receipt_ids)
-
-        # Get undelivered result_ready receipts (defines waiting_results)
-        undelivered_results = await self.receipts.get_undelivered_by_type(
-            tenant_id=tenant_id,
-            to_kind=principal.kind,
-            to_id=principal.id,
-            receipt_type=ReceiptType.TASK_RESULT_READY,
-        )
-
-        # Build waiting_results from tasks with undelivered result receipts
-        waiting_results = []
-        for receipt in undelivered_results:
-            if receipt.task_id:
-                task = await self.tasks.get(tenant_id, receipt.task_id)
-                if task:
-                    waiting_results.append(self._task_to_summary(task))
-
-        # Get assigned tasks (owned by this principal) for running_or_scheduled
-        assigned_tasks, _ = await self.tasks.list(
-            tenant_id=tenant_id,
-            created_by_id=principal.id,
-            limit=max_items,
-        )
-
-        running_or_scheduled = [
-            self._task_to_summary(t)
-            for t in assigned_tasks
-            if not t.is_terminal()
-        ]
 
         # Build anomalies (from receipts or detected conditions)
         anomalies = [
             r.body for r in inbox_receipts
             if r.receipt_type == ReceiptType.SYSTEM_ANOMALY
         ]
+
+        # DEPRECATED: Task-state bucketing removed (Tier 3 cleanup)
+        # Clients should migrate to /v1/obligations/open for correct model.
+        # Return empty lists for backward compatibility.
 
         return {
             "server": {
@@ -151,9 +130,9 @@ class AsyncGateEngine:
             },
             "attention": {
                 "inbox_receipts": [self._receipt_to_dict(r) for r in inbox_receipts],
-                "assigned_tasks": [s.model_dump() for s in running_or_scheduled],
-                "waiting_results": [s.model_dump() for s in waiting_results],
-                "running_or_scheduled": [s.model_dump() for s in running_or_scheduled],
+                "assigned_tasks": [],  # REMOVED: Use /v1/obligations/open
+                "waiting_results": [],  # REMOVED: Use /v1/obligations/open
+                "running_or_scheduled": [],  # REMOVED: Use /v1/obligations/open
                 "anomalies": anomalies,
             },
             "cursor": {

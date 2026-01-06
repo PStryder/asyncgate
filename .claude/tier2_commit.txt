@@ -1,0 +1,33 @@
+Tier 2: Bootstrap replacement with obligation ledger endpoint
+
+Add /v1/obligations/open endpoint implementing canonical bootstrap model.
+
+NEW ENDPOINT: /v1/obligations/open
+- Returns unbucketed obligation dump: {server, relationship, open_obligations, cursor}
+- No attention semantics (no waiting_results, assigned_tasks, running_or_scheduled)
+- No task state bucketing - pure ledger query
+- Uses AsyncGateEngine.list_open_obligations() (added in Tier 0)
+- Cursor-based pagination via since_receipt_id
+- Server and relationship metadata for client awareness
+
+DEPRECATION: /v1/bootstrap (old endpoint)
+- Added deprecation notice in docstring
+- Returns X-AsyncGate-Deprecated header
+- Returns Deprecation: true header
+- Logs warning on usage for migration tracking
+- Still functional (no breaking changes)
+
+NEW SCHEMA: OpenObligationsResponse
+- Defines response structure for new endpoint
+- Enforces unbucketed format (obligations + cursor only)
+
+This completes the shift from "attention inbox" to "obligation ledger" model.
+Agents now query open obligations directly from the receipt ledger, with
+termination determined by receipt chain evidence (type semantics + DB queries).
+
+Tests deferred to Tier 6 (no test framework yet).
+
+Files changed:
+- src/asyncgate/api/router.py: New endpoint + deprecation
+- src/asyncgate/api/schemas.py: New response schema
+- REALIGNMENT_PROGRESS.md: Mark Tier 2 complete

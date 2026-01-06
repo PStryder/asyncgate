@@ -1,0 +1,95 @@
+Tier 1: Validation - Enforce parent linkage and locatability (with Hexy refinements)
+
+TIER 1 COMPLETE: Enforce correct patterns to prevent footguns.
+Incorporates critical refinements from Hexy's feedback.
+
+T1.1: ENFORCE PARENT LINKAGE ON TERMINAL RECEIPTS
+
+Added validation in ReceiptRepository.create():
+- Terminal receipts (task.completed, task.failed, etc.) MUST specify parents
+- ValueError if parents empty: "Without parent linkage, obligations remain open forever"
+- Validates parent exists in database with matching tenant
+- DOES NOT validate principal matching (Hexy refinement)
+  * Different actors discharge obligations: worker → agent, AsyncGate → worker
+  * Only validates: tenant matches, parent exists, type semantics legal
+
+Prevention: Footgun A (eternal obligations from parent-less terminals)
+
+T1.2: ENFORCE LOCATABILITY ON SUCCESS (Phase 1 - Lenient)
+
+Added validation for TASK_COMPLETED receipts:
+- Check for artifacts (store pointers) OR delivery_proof (push confirmation)
+- If NEITHER present:
+  * Strip parents from receipt (keeps obligation OPEN)
+  * Log warning: "SUCCESS WITHOUT LOCATABILITY"
+  * Allow receipt creation (lenient Phase 1)
+  * TODO: Emit system.anomaly receipt (future enhancement)
+
+CRITICAL ENFORCEMENT (Hexy refinement):
+- Success without locatability does NOT discharge obligation
+- Producer must fix and resend with proper locatability
+- Obligation stays open until locatable receipt created
+
+Phase 2 (strict - future): Reject receipt entirely
+
+Prevention: Footgun B ("SUCCEEDED trust me bro" without findable work)
+
+T1.3: ADD LOCATABILITY FIELDS TO RECEIPTBODY
+
+Updated ReceiptBody.task_completed():
+- Changed artifacts: dict → list[dict] (list of store pointers)
+- Added delivery_proof: dict | None parameter
+- Unopinionated shape (Hexy refinement):
+  {
+    "mode": "push" | "store",
+    "target": {...},  # endpoint spec or pointer
+    "status": "succeeded" | "failed",
+    "at": "timestamp",
+    "proof": {...}  # request_id, etag, row_id, http_status, etc.
+  }
+- Comprehensive docstring with examples for both patterns
+
+Supports both:
+- Push delivery (request_id, http_status, ack receipt)
+- Store pointers (S3 urls, DB row ids, drive links, etags)
+
+NOT "agent-ish" shape - unopinionated for real push/store patterns
+
+HEXY'S KEY REFINEMENTS:
+
+1. No Principal Matching in Parent Validation
+   - "Different actors discharge obligations - that's a feature, not a bug"
+   - Worker discharges agent's task.assigned
+   - AsyncGate discharges worker's lease
+
+2. Success Without Locatability → Obligation Stays Open
+   - "Do NOT treat the parent obligation as terminated (important!)"
+   - Strip parents, log anomaly, keep obligation open
+   - Forces producer to fix and resend properly
+
+3. Unopinionated delivery_proof Shape
+   - Original was too "agent-ish"
+   - New shape supports push AND store realities
+   - Mode, target, status, proof fields
+
+FOOTGUNS ELIMINATED:
+
+✓ Footgun A: Terminal without parents → eternal obligations
+  Solution: ValueError on creation, clear error message
+
+✓ Footgun B: Success without locatability → unfindable work
+  Solution: Strip parents, keep obligation open, force fix
+
+MODEL ENFORCEMENT:
+
+"Receipts are contracts, not chat" - now structurally enforced
+"Ledger-only receipts, product elsewhere" - locatability required
+"Different actors discharge" - no principal matching required
+
+FILES CHANGED:
+- src/asyncgate/db/repositories.py (+41 lines validation logic)
+- src/asyncgate/models/receipt.py (updated task_completed schema)
+- REALIGNMENT_PROGRESS.md (marked T1.1, T1.2, T1.3 complete)
+- HEXY_REFINEMENTS.md (NEW - 200 lines documenting all corrections)
+
+Compiles cleanly. Ready for Tier 2 (bootstrap replacement).

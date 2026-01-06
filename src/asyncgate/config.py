@@ -76,8 +76,8 @@ class Settings(BaseSettings):
         default=2, description="Successes to close from half-open"
     )
 
-    # Rate limiting
-    rate_limit_enabled: bool = Field(default=False, description="Enable rate limiting")
+    # Rate limiting (P0.4 - enabled by default)
+    rate_limit_enabled: bool = Field(default=True, description="Enable rate limiting")
     rate_limit_backend: str = Field(
         default="memory", description="Rate limit backend: memory or redis"
     )
@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     rate_limit_default_window_seconds: int = Field(
         default=60, description="Default window size in seconds"
     )
+    
+    @property
+    def rate_limit_active(self) -> bool:
+        """Rate limiting is forced on in staging/production regardless of config."""
+        if self.env in [Environment.STAGING, Environment.PRODUCTION]:
+            return True
+        return self.rate_limit_enabled
 
     # Lease behavior
     default_lease_ttl_seconds: int = Field(default=120, description="Default lease TTL (2 min)")
@@ -117,6 +124,24 @@ class Settings(BaseSettings):
     # Security (v0 - simple shared token)
     api_key: Optional[str] = None
     allow_insecure_dev: bool = Field(default=False, description="Allow unauthenticated in dev")
+    
+    # CORS configuration (P0.3 - explicit allowlist)
+    cors_allowed_origins: list[str] = Field(
+        default=["http://localhost:3000", "http://localhost:8080"],
+        description="Allowed CORS origins (explicit allowlist for security)"
+    )
+    cors_allow_credentials: bool = Field(
+        default=True,
+        description="Allow credentials in CORS requests"
+    )
+    cors_allowed_methods: list[str] = Field(
+        default=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        description="Allowed HTTP methods"
+    )
+    cors_allowed_headers: list[str] = Field(
+        default=["Authorization", "Content-Type", "X-Tenant-ID"],
+        description="Allowed request headers"
+    )
 
     # JWT settings (for OAuth)
     jwt_algorithm: str = "RS256"

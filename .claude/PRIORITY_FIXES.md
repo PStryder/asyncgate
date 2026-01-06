@@ -666,7 +666,13 @@ async def test_receipt_hash_includes_parents():
 
 ## Tracking
 
-- [ ] P0.1: Batch + Index
+- [x] **P0.1: Batch + Index** ✅ COMPLETE (Commit 99f9945)
+  - GIN index added: `idx_receipts_parents_gin`
+  - Batch query implementation: N+1 → 2 queries
+  - Hard cap: 1000 candidates max
+  - Migration: `migrations/001_add_parents_gin_index.sql`
+  - Tests: `tests/test_p01_batch_termination.py`
+  - Performance: 60M rows → 200 rows with 100K receipts
 - [ ] P0.2: Atomic transactions
 - [ ] P0.3: CORS
 - [ ] P0.4: Rate limiting
@@ -675,5 +681,6 @@ async def test_receipt_hash_includes_parents():
 - [ ] P1.2: Timezone
 - [ ] P1.3: Hash canon
 
-**Target:** All P0 fixes within 5 days
+**Target:** All P0 fixes within 5 days  
+**Progress:** 1/5 P0 complete (20%)
 

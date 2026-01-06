@@ -550,8 +550,42 @@ class ReceiptRepository:
         receipt_hash: str | None = None,
     ) -> Receipt:
         """Create a new receipt."""
+        import json
+        
         now = datetime.utcnow()
         receipt_id = uuid4()
+
+        # T5.1: Receipt size limits - receipts are contracts, not chat
+        # Prevent ledger bloat and abuse
+        
+        # Validate body size (64KB max)
+        if body:
+            body_json = json.dumps(body, separators=(',', ':'))
+            body_size = len(body_json.encode('utf-8'))
+            if body_size > 65536:  # 64KB
+                raise ValueError(
+                    f"Receipt body too large: {body_size} bytes (max 64KB). "
+                    f"Receipt bodies are contracts, not chat messages. "
+                    f"Store large payloads externally and reference via artifacts or delivery_proof."
+                )
+        
+        # Validate parents count (10 max - prevent mega-chains)
+        if parents and len(parents) > 10:
+            raise ValueError(
+                f"Too many parent receipts: {len(parents)} (max 10). "
+                f"Receipt bodies are contracts, not chat messages. "
+                f"Avoid creating deep chains - use flat structures where possible."
+            )
+        
+        # Validate artifacts count if present (100 max - prevent stuffing)
+        if body and 'artifacts' in body:
+            artifacts = body['artifacts']
+            if isinstance(artifacts, list) and len(artifacts) > 100:
+                raise ValueError(
+                    f"Too many artifacts: {len(artifacts)} (max 100). "
+                    f"Receipt bodies are contracts, not chat messages. "
+                    f"If you have this many artifacts, you're doing it wrong."
+                )
 
         # Check for duplicate by hash
         if receipt_hash:

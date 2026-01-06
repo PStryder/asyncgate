@@ -411,13 +411,81 @@ await tasks.requeue_with_backoff(tenant_id, task_id, increment_attempt=True)
 
 ---
 
-## NEXT: TIER 5 - Polish & Documentation
+## COMPLETED: TIER 5 - Polish & Documentation
 
-### T5.1: Receipt Size Limits (Make Error Message a Weapon)
-**File:** `src/asyncgate/db/repositories.py` or validation layer
-**From Hexy:** Receipts are contracts, not chat
-- [ ] Cap receipt body size (e.g., 64KB max)
-- [ ] Cap `parents` length (prevent mega-chains, e.g., max 10)
+### ✅ T5.1: Receipt Size Limits
+**File:** `src/asyncgate/db/repositories.py` (ReceiptRepository.create)
+**Status:** COMPLETE
+
+**What was implemented:**
+
+**1. Body size limit (64KB max)**
+```python
+if body_size > 65536:
+    raise ValueError(
+        "Receipt body too large: {size} bytes (max 64KB). "
+        "Receipt bodies are contracts, not chat messages."
+    )
+```
+
+**2. Parents limit (10 max)**
+```python
+if len(parents) > 10:
+    raise ValueError(
+        "Too many parent receipts: {count} (max 10). "
+        "Avoid creating deep chains."
+    )
+```
+
+**3. Artifacts limit (100 max)**
+```python
+if len(artifacts) > 100:
+    raise ValueError(
+        "Too many artifacts: {count} (max 100). "
+        "If you have this many, you're doing it wrong."
+    )
+```
+
+**Error message weaponized:** "Receipt bodies are contracts, not chat messages"
+
+### ✅ T5.2: Add ARCHITECTURE.md
+**File:** `docs/ARCHITECTURE.md` (NEW - 335 lines)
+**Status:** COMPLETE
+
+**Content:**
+- Obligation ledger model vs attention inbox
+- Three-layer architecture
+- State separation (tasks vs receipts)
+- Critical semantic splits (lease expiry vs failure, locatability)
+- API endpoints and migration guide
+- Receipt chain patterns
+- Agent patterns and invariants
+- Performance characteristics
+
+### ✅ T5.3: Add RECEIPT_PATTERNS.md
+**File:** `docs/RECEIPT_PATTERNS.md` (NEW - 452 lines)
+**Status:** COMPLETE
+
+**Content:**
+- Receipts as contracts (immutable, locatable, linked)
+- Pattern 1-7: Assignment, completion, locatability, failures, cancellation, lease expiry
+- Anti-patterns with examples
+- Correct workflow examples
+- Size limits and best practices
+
+### ⚠️ T5.4: Update Existing Docs
+**Status:** DEFERRED
+
+**Reason:** Tier 0-4 implementation complete, new docs comprehensive. Existing docs updates can be done during production deployment when we know which specific files need updating based on actual client usage.
+
+**Documentation now available:**
+- `docs/ARCHITECTURE.md` - Complete system design
+- `docs/RECEIPT_PATTERNS.md` - Concrete examples
+- `.claude/` - Implementation notes and progress
+
+---
+
+## NEXT: TIER 6 - Testing & Validation
 - [ ] Cap `artifacts` count (prevent stuffing, e.g., max 100)
 - [ ] Error message: "Receipt bodies are contracts, not chat messages"
 **Why:** Prevent ledger bloat and abuse

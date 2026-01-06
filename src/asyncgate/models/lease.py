@@ -1,6 +1,6 @@
 """Lease model - worker claim on a task."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -15,11 +15,13 @@ class Lease(BaseModel):
     worker_id: str
     expires_at: datetime
     created_at: datetime
+    acquired_at: datetime  # P1.1: When lease was initially acquired
+    renewal_count: int = 0  # P1.1: Number of renewals
 
     def is_expired(self, now: datetime | None = None) -> bool:
         """Check if lease has expired."""
         if now is None:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
         return now >= self.expires_at
 
 

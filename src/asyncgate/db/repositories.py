@@ -1,6 +1,6 @@
 """Database repositories for AsyncGate entities."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -65,7 +65,7 @@ class TaskRepository:
         unique constraint violation, then fetches existing task. This prevents
         race conditions from check-then-insert pattern.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         task_id = uuid4()
 
         next_eligible_at = now + timedelta(seconds=delay_seconds) if delay_seconds else None
@@ -161,7 +161,7 @@ class TaskRepository:
         result: TaskResult | None = None,
     ) -> Task | None:
         """Update task status."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         values: dict[str, Any] = {
             "status": new_status,
@@ -192,7 +192,7 @@ class TaskRepository:
         result = TaskResult(
             outcome=Outcome.CANCELED,
             error={"reason": reason} if reason else None,
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(timezone.utc),
         )
 
         return await self.update_status(tenant_id, task_id, TaskStatus.CANCELED, result)
@@ -208,7 +208,7 @@ class TaskRepository:
         if not task:
             return None
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         attempt = task.attempt + 1 if increment_attempt else task.attempt
 
         # Calculate backoff: base * 2^(attempt-1), capped at max
@@ -259,7 +259,7 @@ class TaskRepository:
         if not task:
             return None
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         # CRITICAL: Do NOT increment attempt - lease expiry is "lost authority" not "task failed"
         attempt = task.attempt
         
@@ -345,7 +345,7 @@ class LeaseRepository:
         lease_ttl_seconds: int | None = None,
     ) -> list[Lease]:
         """Atomically claim next available tasks."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         ttl = min(
             lease_ttl_seconds or settings.default_lease_ttl_seconds,
             settings.max_lease_ttl_seconds,
@@ -387,7 +387,7 @@ class LeaseRepository:
             elif task_caps and not capabilities:
                 continue
 
-            # Create lease
+            # Create lease (P1.1: track acquisition time and renewal count)
             lease_id = uuid4()
             lease_row = LeaseTable(
                 lease_id=lease_id,
@@ -396,6 +396,8 @@ class LeaseRepository:
                 worker_id=worker_id,
                 expires_at=expires_at,
                 created_at=now,
+                acquired_at=now,  # P1.1: Track when lease was first acquired
+                renewal_count=0,  # P1.1: Start at 0 renewals
             )
             self.session.add(lease_row)
 
@@ -442,7 +444,7 @@ class LeaseRepository:
                 LeaseTable.task_id == task_id,
                 LeaseTable.lease_id == lease_id,
                 LeaseTable.worker_id == worker_id,
-                LeaseTable.expires_at > datetime.utcnow(),
+                LeaseTable.expires_at > datetime.now(timezone.utc),
             )
         )
         row = result.scalar_one_or_none()
@@ -456,25 +458,83 @@ class LeaseRepository:
         worker_id: str,
         extend_by_seconds: int | None = None,
     ) -> Lease | None:
-        """Renew a lease."""
-        lease = await self.validate(tenant_id, task_id, lease_id, worker_id)
-        if not lease:
+        """
+        Renew a lease.
+        
+        P1.1: Enforces renewal limits to prevent lease hoarding:
+        - max_lease_renewals: Maximum number of renewals allowed
+        - max_lease_lifetime_seconds: Absolute maximum lifetime from acquisition
+        
+        Raises:
+            LeaseRenewalLimitExceeded: If renewal count limit exceeded
+            LeaseLifetimeExceeded: If absolute lifetime limit exceeded
+        """
+        # Get the full lease record (including renewal_count and acquired_at)
+        result = await self.session.execute(
+            select(LeaseTable).where(
+                LeaseTable.tenant_id == tenant_id,
+                LeaseTable.task_id == task_id,
+                LeaseTable.lease_id == lease_id,
+                LeaseTable.worker_id == worker_id,
+            )
+        )
+        lease_row = result.scalar_one_or_none()
+        
+        if not lease_row:
             return None
+        
+        now = datetime.now(timezone.utc)
+        
+        # P1.1 ENFORCEMENT: Check renewal count limit
+        if lease_row.renewal_count >= settings.max_lease_renewals:
+            from asyncgate.engine.errors import LeaseRenewalLimitExceeded
+            raise LeaseRenewalLimitExceeded(
+                task_id=str(task_id),
+                lease_id=str(lease_id),
+                renewal_count=lease_row.renewal_count,
+                max_renewals=settings.max_lease_renewals
+            )
+        
+        # P1.1 ENFORCEMENT: Check absolute lifetime limit
+        lifetime = now - lease_row.acquired_at
+        lifetime_seconds = int(lifetime.total_seconds())
+        max_lifetime_seconds = settings.max_lease_lifetime_seconds
+        
+        if lifetime_seconds >= max_lifetime_seconds:
+            from asyncgate.engine.errors import LeaseLifetimeExceeded
+            raise LeaseLifetimeExceeded(
+                task_id=str(task_id),
+                lease_id=str(lease_id),
+                lifetime_seconds=lifetime_seconds,
+                max_lifetime=max_lifetime_seconds
+            )
 
+        # Calculate new expiry
         extend_by = min(
             extend_by_seconds or settings.default_lease_ttl_seconds,
             settings.max_lease_ttl_seconds,
         )
-        new_expires_at = datetime.utcnow() + timedelta(seconds=extend_by)
+        new_expires_at = now + timedelta(seconds=extend_by)
 
+        # Update lease: increment renewal_count and extend expiry
         await self.session.execute(
             update(LeaseTable)
             .where(LeaseTable.lease_id == lease_id)
-            .values(expires_at=new_expires_at)
+            .values(
+                expires_at=new_expires_at,
+                renewal_count=LeaseTable.renewal_count + 1,  # P1.1: Increment counter
+            )
         )
 
-        lease.expires_at = new_expires_at
-        return lease
+        # Return updated lease
+        return Lease(
+            lease_id=lease_row.lease_id,
+            tenant_id=lease_row.tenant_id,
+            task_id=lease_row.task_id,
+            worker_id=lease_row.worker_id,
+            expires_at=new_expires_at,
+            created_at=lease_row.created_at,
+        )
 
     async def release(self, tenant_id: UUID, task_id: UUID) -> bool:
         """Release a lease."""
@@ -494,7 +554,7 @@ class LeaseRepository:
             limit: Maximum number of leases to return
             instance_id: Optional instance filter for multi-instance deployments
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         # Build query with join to tasks for instance filtering
         query = (
@@ -552,7 +612,7 @@ class ReceiptRepository:
         """Create a new receipt."""
         import json
         
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         receipt_id = uuid4()
 
         # T5.1: Receipt size limits - receipts are contracts, not chat
@@ -715,7 +775,7 @@ class ReceiptRepository:
                 ReceiptTable.receipt_id.in_(receipt_ids),
                 ReceiptTable.delivered_at.is_(None),
             )
-            .values(delivered_at=datetime.utcnow())
+            .values(delivered_at=datetime.now(timezone.utc))
         )
         return result.rowcount
 
@@ -1053,7 +1113,7 @@ class ProgressRepository:
         progress: dict[str, Any],
     ) -> Progress:
         """Update or create progress for a task."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Upsert
         result = await self.session.execute(
@@ -1119,7 +1179,7 @@ class RelationshipRepository:
         principal_instance_id: str | None = None,
     ) -> Relationship:
         """Create or update relationship."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         result = await self.session.execute(
             select(RelationshipTable).where(

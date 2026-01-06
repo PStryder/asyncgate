@@ -113,6 +113,19 @@ class LeaseTable(Base):
     worker_id: Mapped[str] = mapped_column(String(255), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    
+    # P1.1: Renewal tracking
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), 
+        nullable=False,
+        comment="When lease was initially acquired (for absolute lifetime tracking)"
+    )
+    renewal_count: Mapped[int] = mapped_column(
+        Integer, 
+        nullable=False, 
+        default=0,
+        comment="Number of times lease has been renewed (P1.1 - prevents hoarding)"
+    )
 
     # Relationship to task
     task: Mapped[TaskTable] = relationship("TaskTable", back_populates="lease")

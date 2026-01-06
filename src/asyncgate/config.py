@@ -100,6 +100,16 @@ class Settings(BaseSettings):
     max_lease_ttl_seconds: int = Field(default=1800, description="Max lease TTL (30 min)")
     lease_sweep_interval_seconds: int = Field(default=5, description="Lease sweep cadence")
     lease_grace_seconds: int = Field(default=0, description="Lease grace period")
+    
+    # P1.1: Lease renewal limits (prevents hoarding DoS)
+    max_lease_renewals: int = Field(
+        default=10, 
+        description="Maximum times a lease can be renewed before forcing release"
+    )
+    max_lease_lifetime_seconds: int = Field(
+        default=7200,  # 2 hours
+        description="Absolute maximum lifetime for a lease (acquired_at to now)"
+    )
 
     # Task retries
     default_max_attempts: int = Field(default=2, description="Default max task attempts")

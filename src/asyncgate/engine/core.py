@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -489,7 +489,7 @@ class AsyncGateEngine:
                 outcome=Outcome.SUCCEEDED,
                 result=result,
                 artifacts=artifacts,
-                completed_at=datetime.utcnow(),
+                completed_at=datetime.now(timezone.utc),
             )
             await self.tasks.update_status(tenant_id, task_id, TaskStatus.SUCCEEDED, task_result)
 
@@ -583,7 +583,7 @@ class AsyncGateEngine:
                 task_result = TaskResult(
                     outcome=Outcome.FAILED,
                     error=error,
-                    completed_at=datetime.utcnow(),
+                    completed_at=datetime.now(timezone.utc),
                 )
                 await self.tasks.update_status(tenant_id, task_id, TaskStatus.FAILED, task_result)
 

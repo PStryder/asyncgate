@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Optional, TypeVar
 
@@ -181,7 +181,7 @@ class CircuitBreaker:
             self._stats.failure_count += 1
             self._stats.total_failures += 1
             self._stats.success_count = 0  # Reset success counter
-            self._stats.last_failure_time = datetime.utcnow()
+            self._stats.last_failure_time = datetime.now(timezone.utc)
 
             logger.warning(
                 f"Circuit {self.name} failure ({self._stats.failure_count}/"
@@ -199,7 +199,7 @@ class CircuitBreaker:
     async def _transition_to_open(self):
         """Transition to OPEN state."""
         self._state = CircuitState.OPEN
-        self._stats.opened_at = datetime.utcnow()
+        self._stats.opened_at = datetime.now(timezone.utc)
         self._stats.half_open_calls = 0
         logger.error(
             f"Circuit {self.name} opened after "
@@ -233,14 +233,14 @@ class CircuitBreaker:
         """Check if enough time has passed to try half-open."""
         if not self._stats.opened_at:
             return False
-        elapsed = (datetime.utcnow() - self._stats.opened_at).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - self._stats.opened_at).total_seconds()
         return elapsed >= self.config.timeout_seconds
 
     def _seconds_until_half_open(self) -> int:
         """Calculate seconds until half-open attempt."""
         if not self._stats.opened_at:
             return self.config.timeout_seconds
-        elapsed = (datetime.utcnow() - self._stats.opened_at).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - self._stats.opened_at).total_seconds()
         remaining = max(0, self.config.timeout_seconds - elapsed)
         return int(remaining)
 

@@ -72,3 +72,33 @@ class RateLimitExceededError(AsyncGateError):
         self.limit = limit
         self.window = window
         self.retry_after = retry_after
+
+
+class LeaseRenewalLimitExceeded(AsyncGateError):
+    """Lease has reached maximum renewal count (P1.1)."""
+
+    def __init__(self, task_id: str, lease_id: str, renewal_count: int, max_renewals: int):
+        super().__init__(
+            f"Lease {lease_id} for task {task_id} has reached maximum renewals "
+            f"({renewal_count}/{max_renewals}). Release and reclaim to continue.",
+            "LEASE_RENEWAL_LIMIT_EXCEEDED",
+        )
+        self.task_id = task_id
+        self.lease_id = lease_id
+        self.renewal_count = renewal_count
+        self.max_renewals = max_renewals
+
+
+class LeaseLifetimeExceeded(AsyncGateError):
+    """Lease has exceeded absolute lifetime limit (P1.1)."""
+
+    def __init__(self, task_id: str, lease_id: str, lifetime_seconds: int, max_lifetime: int):
+        super().__init__(
+            f"Lease {lease_id} for task {task_id} has exceeded maximum lifetime "
+            f"({lifetime_seconds}s/{max_lifetime}s). Release and reclaim to continue.",
+            "LEASE_LIFETIME_EXCEEDED",
+        )
+        self.task_id = task_id
+        self.lease_id = lease_id
+        self.lifetime_seconds = lifetime_seconds
+        self.max_lifetime = max_lifetime

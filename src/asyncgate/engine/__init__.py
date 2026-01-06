@@ -5,6 +5,8 @@ from asyncgate.engine.errors import (
     AsyncGateError,
     InvalidStateTransition,
     LeaseInvalidOrExpired,
+    LeaseLifetimeExceeded,
+    LeaseRenewalLimitExceeded,
     TaskNotFound,
     UnauthorizedError,
 )
@@ -14,6 +16,8 @@ __all__ = [
     "AsyncGateError",
     "InvalidStateTransition",
     "LeaseInvalidOrExpired",
+    "LeaseLifetimeExceeded",
+    "LeaseRenewalLimitExceeded",
     "TaskNotFound",
     "UnauthorizedError",
 ]

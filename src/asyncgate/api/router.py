@@ -33,6 +33,7 @@ from asyncgate.api.schemas import (
     TaskResponse,
 )
 from asyncgate.api.deps import get_db_session, get_tenant_id, verify_api_key
+from asyncgate.middleware.rate_limit import rate_limit_dependency
 from asyncgate.engine import (
     AsyncGateEngine,
     InvalidStateTransition,
@@ -42,7 +43,10 @@ from asyncgate.engine import (
 )
 from asyncgate.models import Principal, PrincipalKind
 
-router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
+router = APIRouter(
+    prefix="/v1",
+    dependencies=[Depends(verify_api_key), Depends(rate_limit_dependency)],
+)
 
 
 # ============================================================================

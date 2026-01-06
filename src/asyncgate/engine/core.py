@@ -244,7 +244,11 @@ class AsyncGateEngine:
         principal: Principal,
         reason: str | None = None,
     ) -> dict[str, Any]:
-        """Cancel a task."""
+        """
+        Cancel a task.
+        
+        P0.2: All state changes + receipt emissions are atomic via savepoint.
+        """
         task = await self.tasks.get(tenant_id, task_id)
         if not task:
             raise TaskNotFound(str(task_id))
@@ -261,14 +265,16 @@ class AsyncGateEngine:
         if task.is_terminal():
             return {"ok": False, "status": task.status.value}
 
-        # Release any active lease
-        await self.leases.release(tenant_id, task_id)
+        # P0.2: ATOMIC BLOCK - Lease release + task cancellation + receipt
+        async with self.session.begin_nested():  # SAVEPOINT
+            # 1. Release any active lease
+            await self.leases.release(tenant_id, task_id)
 
-        # Cancel the task
-        task = await self.tasks.cancel(tenant_id, task_id, reason)
+            # 2. Cancel the task
+            task = await self.tasks.cancel(tenant_id, task_id, reason)
 
-        # Emit result_ready receipt to owner
-        await self._emit_result_ready_receipt(tenant_id, task)
+            # 3. Emit result_ready receipt to owner
+            await self._emit_result_ready_receipt(tenant_id, task)
 
         return {"ok": True, "status": task.status.value}
 
@@ -458,8 +464,13 @@ class AsyncGateEngine:
         result: dict[str, Any],
         artifacts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Mark a task as successfully completed."""
-        # Validate lease
+        """
+        Mark a task as successfully completed.
+        
+        P0.2: All state changes + receipt emissions are atomic via savepoint.
+        If any operation fails, entire transaction rolls back.
+        """
+        # Validate lease (outside transaction - read-only check)
         lease = await self.leases.validate(tenant_id, task_id, lease_id, worker_id)
         if not lease:
             raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
@@ -471,40 +482,43 @@ class AsyncGateEngine:
         if not task.can_transition_to(TaskStatus.SUCCEEDED):
             raise InvalidStateTransition(task.status.value, TaskStatus.SUCCEEDED.value)
 
-        # Update task to succeeded
-        task_result = TaskResult(
-            outcome=Outcome.SUCCEEDED,
-            result=result,
-            artifacts=artifacts,
-            completed_at=datetime.utcnow(),
-        )
-        await self.tasks.update_status(tenant_id, task_id, TaskStatus.SUCCEEDED, task_result)
-
-        # Release lease
-        await self.leases.release(tenant_id, task_id)
-
-        # Emit task.completed receipt
-        worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
-        asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
-
-        await self._emit_receipt(
-            tenant_id=tenant_id,
-            receipt_type=ReceiptType.TASK_COMPLETED,
-            from_principal=worker_principal,
-            to_principal=asyncgate_principal,
-            task_id=task_id,
-            lease_id=lease_id,
-            body=ReceiptBody.task_completed(
-                result_summary="Task completed successfully",
-                result_payload=result,
+        # P0.2: ATOMIC BLOCK - All or nothing
+        async with self.session.begin_nested():  # SAVEPOINT
+            # 1. Update task to succeeded
+            task_result = TaskResult(
+                outcome=Outcome.SUCCEEDED,
+                result=result,
                 artifacts=artifacts,
-            ),
-        )
+                completed_at=datetime.utcnow(),
+            )
+            await self.tasks.update_status(tenant_id, task_id, TaskStatus.SUCCEEDED, task_result)
 
-        # Emit result_ready to task owner
-        task = await self.tasks.get(tenant_id, task_id)
-        await self._emit_result_ready_receipt(tenant_id, task)
+            # 2. Release lease
+            await self.leases.release(tenant_id, task_id)
 
+            # 3. Emit task.completed receipt
+            worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
+            asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+
+            await self._emit_receipt(
+                tenant_id=tenant_id,
+                receipt_type=ReceiptType.TASK_COMPLETED,
+                from_principal=worker_principal,
+                to_principal=asyncgate_principal,
+                task_id=task_id,
+                lease_id=lease_id,
+                body=ReceiptBody.task_completed(
+                    result_summary="Task completed successfully",
+                    result_payload=result,
+                    artifacts=artifacts,
+                ),
+            )
+
+            # 4. Emit result_ready to task owner
+            task = await self.tasks.get(tenant_id, task_id)
+            await self._emit_result_ready_receipt(tenant_id, task)
+        
+        # If we reach here, all operations succeeded and were committed
         return {"ok": True}
 
     async def fail(
@@ -518,11 +532,14 @@ class AsyncGateEngine:
     ) -> dict[str, Any]:
         """
         Mark a task as failed.
+        
+        P0.2: All state changes + receipt emissions are atomic via savepoint.
+        Handles both requeue path and terminal failure path atomically.
 
         If retryable and attempts remaining, requeue with backoff.
         Otherwise mark as terminal failure.
         """
-        # Validate lease
+        # Validate lease (outside transaction - read-only check)
         lease = await self.leases.validate(tenant_id, task_id, lease_id, worker_id)
         if not lease:
             raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
@@ -531,64 +548,69 @@ class AsyncGateEngine:
         if not task:
             raise TaskNotFound(str(task_id))
 
-        # Release lease
-        await self.leases.release(tenant_id, task_id)
-
-        # Check if should retry
+        # Check if should retry (decision logic outside transaction)
         should_requeue = retryable and (task.attempt + 1) < task.max_attempts
-        next_eligible_at = None
 
-        if should_requeue:
-            task = await self.tasks.requeue_with_backoff(tenant_id, task_id, increment_attempt=True)
-            next_eligible_at = task.next_eligible_at
-            
-            # Emit task.requeued receipt to task owner (agent-visible)
+        # P0.2: ATOMIC BLOCK - All state changes + receipts
+        async with self.session.begin_nested():  # SAVEPOINT
+            # 1. Release lease first (common to both paths)
+            await self.leases.release(tenant_id, task_id)
+
+            if should_requeue:
+                # REQUEUE PATH: Task gets another attempt
+                task = await self.tasks.requeue_with_backoff(tenant_id, task_id, increment_attempt=True)
+                next_eligible_at = task.next_eligible_at
+                
+                # Emit task.requeued receipt to task owner (agent-visible)
+                asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+                await self._emit_receipt(
+                    tenant_id=tenant_id,
+                    receipt_type=ReceiptType.TASK_FAILED,
+                    from_principal=asyncgate_principal,
+                    to_principal=task.created_by,
+                    task_id=task_id,
+                    body={
+                        "reason": "Worker reported retryable failure",
+                        "error": error,
+                        "requeued": True,
+                        "attempt": task.attempt,
+                        "max_attempts": task.max_attempts,
+                        "next_eligible_at": next_eligible_at.isoformat() if next_eligible_at else None,
+                    },
+                )
+            else:
+                # TERMINAL FAILURE PATH: No more retries
+                task_result = TaskResult(
+                    outcome=Outcome.FAILED,
+                    error=error,
+                    completed_at=datetime.utcnow(),
+                )
+                await self.tasks.update_status(tenant_id, task_id, TaskStatus.FAILED, task_result)
+
+                # Emit result_ready to task owner
+                task = await self.tasks.get(tenant_id, task_id)
+                await self._emit_result_ready_receipt(tenant_id, task)
+                
+                next_eligible_at = None
+
+            # 2. Emit worker's task.failed receipt (system record, common to both paths)
+            worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
             asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+
             await self._emit_receipt(
                 tenant_id=tenant_id,
                 receipt_type=ReceiptType.TASK_FAILED,
-                from_principal=asyncgate_principal,
-                to_principal=task.created_by,
+                from_principal=worker_principal,
+                to_principal=asyncgate_principal,
                 task_id=task_id,
-                body={
-                    "reason": "Worker reported retryable failure",
-                    "error": error,
-                    "requeued": True,
-                    "attempt": task.attempt,
-                    "max_attempts": task.max_attempts,
-                    "next_eligible_at": next_eligible_at.isoformat() if next_eligible_at else None,
-                },
+                lease_id=lease_id,
+                body=ReceiptBody.task_failed(
+                    error=error,
+                    retry_recommended=retryable,
+                ),
             )
-        else:
-            # Terminal failure
-            task_result = TaskResult(
-                outcome=Outcome.FAILED,
-                error=error,
-                completed_at=datetime.utcnow(),
-            )
-            await self.tasks.update_status(tenant_id, task_id, TaskStatus.FAILED, task_result)
-
-            # Emit result_ready to task owner
-            task = await self.tasks.get(tenant_id, task_id)
-            await self._emit_result_ready_receipt(tenant_id, task)
-
-        # Emit task.failed receipt (system record)
-        worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
-        asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
-
-        await self._emit_receipt(
-            tenant_id=tenant_id,
-            receipt_type=ReceiptType.TASK_FAILED,
-            from_principal=worker_principal,
-            to_principal=asyncgate_principal,
-            task_id=task_id,
-            lease_id=lease_id,
-            body=ReceiptBody.task_failed(
-                error=error,
-                retry_recommended=retryable,
-            ),
-        )
-
+        
+        # If we reach here, all operations succeeded and were committed
         return {
             "ok": True,
             "requeued": should_requeue,
@@ -608,6 +630,9 @@ class AsyncGateEngine:
         
         CRITICAL: Uses requeue_on_expiry() which does NOT increment attempt.
         Lease expiry is "lost authority" (worker crash), not "task failed".
+        
+        P0.2: Each lease expiry is atomic - requeue + lease release + receipt
+        all succeed or all rollback.
         
         Args:
             batch_size: Number of leases to process per batch (default 20).
@@ -634,36 +659,45 @@ class AsyncGateEngine:
             # This prevents all expired tasks from becoming eligible simultaneously
             jitter_seconds = random.uniform(0, 5)
             
-            # CRITICAL: Use requeue_on_expiry (does NOT increment attempt)
-            # Lease expiry = "lost authority", NOT "task failed"
-            await self.tasks.requeue_on_expiry(
-                lease.tenant_id,
-                lease.task_id,
-                jitter_seconds=jitter_seconds,
-            )
+            # P0.2: ATOMIC BLOCK - Each lease expiry is atomic
+            try:
+                async with self.session.begin_nested():  # SAVEPOINT
+                    # 1. CRITICAL: Use requeue_on_expiry (does NOT increment attempt)
+                    # Lease expiry = "lost authority", NOT "task failed"
+                    await self.tasks.requeue_on_expiry(
+                        lease.tenant_id,
+                        lease.task_id,
+                        jitter_seconds=jitter_seconds,
+                    )
 
-            # Release expired lease
-            await self.leases.release(lease.tenant_id, lease.task_id)
+                    # 2. Release expired lease
+                    await self.leases.release(lease.tenant_id, lease.task_id)
 
-            # Emit lease.expired receipt to task owner
-            asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+                    # 3. Emit lease.expired receipt to task owner
+                    asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
 
-            await self._emit_receipt(
-                tenant_id=lease.tenant_id,
-                receipt_type=ReceiptType.LEASE_EXPIRED,
-                from_principal=asyncgate_principal,
-                to_principal=task.created_by,
-                task_id=task.task_id,
-                lease_id=lease.lease_id,
-                body=ReceiptBody.lease_expired(
-                    task_id=task.task_id,
-                    previous_worker_id=lease.worker_id,
-                    attempt=task.attempt,
-                    requeued=True,
-                ),
-            )
-
-            count += 1
+                    await self._emit_receipt(
+                        tenant_id=lease.tenant_id,
+                        receipt_type=ReceiptType.LEASE_EXPIRED,
+                        from_principal=asyncgate_principal,
+                        to_principal=task.created_by,
+                        task_id=task.task_id,
+                        lease_id=lease.lease_id,
+                        body=ReceiptBody.lease_expired(
+                            task_id=task.task_id,
+                            previous_worker_id=lease.worker_id,
+                            attempt=task.attempt,
+                            requeued=True,
+                        ),
+                    )
+                
+                count += 1
+            except Exception as e:
+                # Log but continue processing other leases
+                import logging
+                logger = logging.getLogger("asyncgate.engine")
+                logger.error(f"Failed to expire lease {lease.lease_id}: {e}", exc_info=True)
+                continue
             
             # Batch processing: commit and pause between batches
             if count % batch_size == 0:

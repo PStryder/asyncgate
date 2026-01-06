@@ -685,12 +685,27 @@ async def test_receipt_hash_includes_parents():
   - Forced ON in staging/production
   - Property: `rate_limit_active`
   - Tests: Environment-based override verification
-- [ ] P0.5: Hash parents
+- [x] **P0.5: Hash parents** ✅ COMPLETE (Commit d053195)
+  - Updated `_compute_receipt_hash()` signature
+  - Include parents in hash (sorted list)
+  - Canonical JSON separators (P1.3 bonus)
+  - Tests: `tests/test_p05_hash_parents.py` (327 lines)
+  - Fixes: Incorrect deduplication with different parents
 - [ ] P1.1: Renewal limits
 - [ ] P1.2: Timezone
-- [ ] P1.3: Hash canon
+- [ ] P1.3: Hash canon (✅ done as part of P0.5)
 
 **Target:** All P0 fixes within 5 days  
-**Progress:** 3/5 P0 complete (60%)  
-**Remaining:** P0.2 (6-8h), P0.5 (2-3h) = 8-11 hours
+**Progress:** 4/5 P0 complete (80%) 🎯  
+**Remaining:** P0.2 (atomic transactions) = 6-8 hours
+
+## Quick Wins Complete! 🚀
+
+All quick wins (P0.1, P0.3, P0.4, P0.5) are done.
+
+**Total time:** ~4-5 hours  
+**Issues fixed:** 4 CRITICAL production blockers  
+**Commits:** 3 (99f9945, 3bd7f82, d053195)
+
+**Remaining P0 work:** P0.2 (atomic transactions) - Most complex fix
 

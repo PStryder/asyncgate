@@ -216,7 +216,7 @@ class RateLimiter:
         Raises:
             HTTPException: 429 if rate limited
         """
-        if not settings.rate_limit_enabled:
+        if not settings.rate_limit_active:
             return
 
         # Determine rule

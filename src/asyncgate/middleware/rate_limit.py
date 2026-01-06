@@ -227,17 +227,27 @@ class RateLimiter:
         if key_override:
             key = key_override
         else:
-            # Try tenant_id from query/header, fall back to client IP
-            tenant_id = request.query_params.get("tenant_id")
-            if not tenant_id:
-                tenant_id = request.headers.get("X-Tenant-ID")
+            # P1-4: When auth is enabled, key by API key hash to prevent tenant spoofing
+            # In insecure dev mode, fall back to tenant_id/IP for convenience
+            auth_enabled = settings.api_key and not settings.allow_insecure_dev
             
-            if tenant_id:
-                key = f"{rule.key_prefix}tenant:{tenant_id}"
+            if auth_enabled:
+                # Auth enabled: Use API key hash (prevents tenant ID spoofing)
+                import hashlib
+                key_hash = hashlib.sha256(settings.api_key.encode()).hexdigest()[:16]
+                key = f"{rule.key_prefix}auth:{key_hash}"
             else:
-                # Fall back to client IP
-                client_ip = request.client.host if request.client else "unknown"
-                key = f"{rule.key_prefix}ip:{client_ip}"
+                # Insecure dev mode: Try tenant_id from query/header, fall back to client IP
+                tenant_id = request.query_params.get("tenant_id")
+                if not tenant_id:
+                    tenant_id = request.headers.get("X-Tenant-ID")
+                
+                if tenant_id:
+                    key = f"{rule.key_prefix}tenant:{tenant_id}"
+                else:
+                    # Fall back to client IP
+                    client_ip = request.client.host if request.client else "unknown"
+                    key = f"{rule.key_prefix}ip:{client_ip}"
 
         # Check limit
         allowed, remaining, reset_time = await self.backend.check_rate_limit(

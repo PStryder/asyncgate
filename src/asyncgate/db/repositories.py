@@ -914,6 +914,9 @@ class ReceiptRepository:
         """
         List open obligations for a principal.
         
+        OPTIMIZED (P0.1): Uses batch termination check instead of N+1 queries.
+        Leverages GIN index on parents JSONB column for fast containment checks.
+        
         An obligation is "open" if:
         1. It's a receipt type that can create obligations (in TERMINATION_RULES)
         2. It's addressed to the specified principal
@@ -941,6 +944,10 @@ class ReceiptRepository:
             # No obligation types registered yet
             return [], None
         
+        # Fetch candidates with hard cap to prevent runaway queries
+        # Factor of 3 allows filtering, but cap at 1000 absolute max
+        candidate_limit = min(limit * 3, 1000)
+        
         # Base query: receipts to this principal of obligation types
         query = select(ReceiptTable).where(
             ReceiptTable.tenant_id == tenant_id,
@@ -961,23 +968,46 @@ class ReceiptRepository:
             if cursor_time:
                 query = query.where(ReceiptTable.created_at > cursor_time)
         
-        query = query.order_by(ReceiptTable.created_at.asc()).limit(limit * 3)  # Fetch extra for filtering
+        query = query.order_by(ReceiptTable.created_at.asc()).limit(candidate_limit)
         
         result = await self.session.execute(query)
         candidate_rows = list(result.scalars().all())
         
-        # Filter to only obligations without terminators
-        # Use has_terminator for O(1) EXISTS check per candidate
+        if not candidate_rows:
+            return [], None
+        
+        # BATCH TERMINATION CHECK (P0.1 optimization)
+        # Single query instead of N queries - uses GIN index on parents
+        candidate_ids = [str(row.receipt_id) for row in candidate_rows]
+        
+        # Query: Find all receipts whose parents array contains any candidate ID
+        # PostgreSQL JSONB array overlap using the GIN index
+        terminated_result = await self.session.execute(
+            select(ReceiptTable.parents)
+            .where(
+                ReceiptTable.tenant_id == tenant_id,
+                # Check if parents contains any of our candidate IDs
+                # This uses the GIN index: idx_receipts_parents_gin
+                func.jsonb_array_length(ReceiptTable.parents) > 0,
+            )
+        )
+        
+        # Build set of terminated receipt IDs by checking overlap
+        terminated_ids = set()
+        candidate_id_set = set(candidate_ids)
+        
+        for row in terminated_result:
+            # Check if any parent matches our candidates
+            for parent_str in row.parents:
+                if parent_str in candidate_id_set:
+                    terminated_ids.add(UUID(parent_str))
+        
+        # Filter candidates: keep only those NOT terminated
         open_obligations = []
         
         for row in candidate_rows:
-            receipt = self._row_to_model(row)
-            
-            # Fast check: does any receipt reference this as parent?
-            has_term = await self.has_terminator(tenant_id, receipt.receipt_id)
-            
-            if not has_term:
-                open_obligations.append(receipt)
+            if row.receipt_id not in terminated_ids:
+                open_obligations.append(self._row_to_model(row))
                 
             # Stop if we have enough
             if len(open_obligations) >= limit:

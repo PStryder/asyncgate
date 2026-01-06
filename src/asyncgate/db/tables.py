@@ -181,6 +181,8 @@ class ReceiptTable(Base):
         Index("idx_receipts_task", "tenant_id", "task_id", "created_at"),
         # Index for deduplication (redundant with unique constraint, but kept for explicit queries)
         Index("idx_receipts_hash", "tenant_id", "hash"),
+        # GIN index for parents array containment queries (P0.1 - performance critical)
+        Index("idx_receipts_parents_gin", "parents", postgresql_using="gin"),
     )
 
 

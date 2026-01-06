@@ -1,0 +1,65 @@
+Spec Update v0.3: Production Hardening Addendum
+
+Updated AsyncGate specification to incorporate all production hardening
+discovered during Tiers 0-6 implementation.
+
+ADDED: Production Hardening Addendum (v0.3)
+
+New sections (PH.1-PH.13):
+
+PH.1: Obligation Ledger Model
+- Termination registry (type semantics truth table)
+- DB-driven termination checks (O(1) EXISTS queries)
+- Open obligations query (canonical bootstrap primitive)
+
+PH.2: Parent Linkage Enforcement
+- MANDATORY parent linkage for terminal receipts
+- Prevents "haunted bootstrap" (eternal obligations)
+- Cross-actor discharge validation
+
+PH.3: Locatability Requirement
+- artifacts OR delivery_proof required for success
+- Phase 1 (lenient): Strip parents if missing
+- Phase 2 (strict): Reject without locatability
+
+PH.4: Lease/Retry Separation
+- requeue_on_expiry (no attempt increment)
+- requeue_with_backoff (with attempt increment)
+- Updated lease expiry sweep logic
+- Prevents worker crash retry burn
+
+PH.5: Receipt Size Limits
+- Body: 64KB max
+- Parents: 10 max
+- Artifacts: 100 max
+- Error: "Receipt bodies are contracts, not chat messages"
+
+PH.6: Unbucketed Bootstrap Endpoint
+- GET /v1/obligations/open (canonical query)
+- Unbucketed response (no semantic bucketing)
+- Deprecate /v1/bootstrap (maintain for compatibility)
+
+PH.7-PH.13: Implementation, Migration, Testing
+- Implementation tier summary
+- Normative requirements
+- Migration guide v0.2 → v0.3
+- Test coverage requirements
+- Version compatibility
+- Production readiness checklist
+
+ALSO ADDED: .claude/SPEC_ALIGNMENT.md
+- Comprehensive spec compliance analysis
+- 95%+ alignment verification
+- Architectural enhancements documentation
+
+SPEC STATUS:
+- Original v0.1-v0.2: Core model + bootstrap + receipts
+- New v0.3: Production-hardened with obligation ledger
+- Total spec: 3,541 lines (914 lines addendum)
+
+This addendum is NORMATIVE for production deployments.
+All PH.1-PH.6 requirements are mandatory for v0.3 compliance.
+
+Files changed:
+- AsyncGate Spec.txt: +914 lines (Production Hardening Addendum)
+- .claude/SPEC_ALIGNMENT.md: Complete spec verification

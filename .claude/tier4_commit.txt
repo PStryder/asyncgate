@@ -1,0 +1,36 @@
+Tier 4: CRITICAL - Separate lease expiry from retry backoff
+
+Fix production footgun where worker crashes burned retry attempts.
+
+PROBLEM:
+Lease expiry was calling requeue_with_backoff(increment_attempt=True),
+treating worker crash as task failure. Flaky workers caused tasks to hit
+max_attempts prematurely, resulting in false terminal failures.
+
+SOLUTION:
+Semantic separation between "lost authority" and "task failed":
+
+NEW: TaskRepository.requeue_on_expiry()
+- Does NOT increment attempt counter (CRITICAL)
+- Uses minimal jitter (0-5s) instead of exponential backoff
+- Returns task to QUEUED status
+- Called on lease expiry only
+
+UPDATED: AsyncGateEngine.expire_leases()
+- Changed from: requeue_with_backoff(increment_attempt=True)
+- Changed to: requeue_on_expiry(jitter_seconds=random.uniform(0, 5))
+- Simplified double-jitter logic (now handled in requeue_on_expiry)
+
+PRESERVED: TaskRepository.requeue_with_backoff()
+- Unchanged for actual task failures
+- Still increments attempt counter (correct for real failures)
+- Uses exponential backoff
+
+IMPACT:
+Worker crashes no longer eat retry attempts. Tasks can now survive
+transient worker failures without hitting terminal state prematurely.
+
+Files changed:
+- src/asyncgate/db/repositories.py: Add requeue_on_expiry method
+- src/asyncgate/engine/core.py: Update expire_leases to use new method
+- .claude/REALIGNMENT_PROGRESS.md: Mark Tier 4 complete

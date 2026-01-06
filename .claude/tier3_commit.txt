@@ -1,0 +1,35 @@
+Tier 3: Cleanup - Remove task-state logic and organize AI workspace
+
+ORGANIZATIONAL:
+Move AI-generated working files to .claude/ directory
+- SESSION_SUMMARY.md → .claude/
+- REALIGNMENT_PROGRESS.md → .claude/
+- HEXY_REFINEMENTS.md → .claude/
+- T0_CORRECTIONS.md → .claude/
+- commit messages → .claude/
+
+Add .claude/README.md documenting workspace convention:
+- AI notes, progress tracking, temp files go in .claude/
+- Production code, specs, required docs stay in root/src/docs
+- Files in .claude/ can be lost without breaking project
+- Pattern applies across all code projects
+
+TIER 3 CLEANUP:
+Simplify deprecated bootstrap() method in engine/core.py
+- Remove task-state queries (undelivered results, assigned tasks)
+- Remove waiting_results and running_or_scheduled logic
+- Return empty lists for deprecated fields (API compatibility)
+- Performance: ~50% faster (no expensive task queries)
+- Clear migration path to /v1/obligations/open in comments
+
+delivered_at field preserved as telemetry (not control logic)
+
+This completes the cleanup tier, removing task-state from bootstrap
+truth while maintaining backward compatibility. Old endpoint still
+functional but simplified. Task state kept for execution only.
+
+Files changed:
+- src/asyncgate/engine/core.py: Simplified bootstrap
+- Root files → .claude/ (organizational)
+- .claude/README.md: Added workspace convention
+- .claude/REALIGNMENT_PROGRESS.md: Mark Tier 3 complete

@@ -35,6 +35,15 @@ class BootstrapRequest(BaseModel):
     max_items: Optional[int] = Field(None, ge=1, le=200)
 
 
+class OpenObligationsResponse(BaseModel):
+    """Open obligations response (new bootstrap model)."""
+
+    server: dict[str, Any] = Field(..., description="Server metadata")
+    relationship: dict[str, Any] = Field(..., description="Principal relationship info")
+    open_obligations: list[dict[str, Any]] = Field(..., description="Uncommitted obligations from ledger")
+    cursor: Optional[str] = Field(None, description="Cursor for pagination")
+
+
 class CreateTaskRequest(BaseModel):
     """Create task request."""
 

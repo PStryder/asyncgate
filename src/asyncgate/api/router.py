@@ -1,5 +1,6 @@
 """REST API router."""
 
+import json
 from typing import Optional
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from asyncgate.api.schemas import (
     LeaseClaimResponse,
     ListReceiptsResponse,
     ListTasksResponse,
+    OpenObligationsResponse,
     RenewLeaseRequest,
     RenewLeaseResponse,
     ReportProgressRequest,
@@ -65,7 +67,85 @@ async def get_config(
 
 
 # ============================================================================
-# Bootstrap
+# Obligations (New Bootstrap Model)
+# ============================================================================
+
+
+@router.get("/obligations/open", response_model=OpenObligationsResponse)
+async def get_open_obligations(
+    principal_kind: str = Query(...),
+    principal_id: str = Query(...),
+    principal_instance_id: Optional[str] = Query(None),
+    since_receipt_id: Optional[UUID] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: UUID = Depends(get_tenant_id),
+):
+    """
+    Get open obligations for a principal (obligation ledger model).
+    
+    Returns uncommitted obligations from the receipt ledger. An obligation
+    is "open" if no terminator receipt exists that references it as a parent.
+    
+    This is the canonical bootstrap endpoint - pure ledger dump with no
+    bucketing, attention semantics, or task state interpretation.
+    """
+    from fastapi import Response
+    
+    engine = AsyncGateEngine(session)
+
+    principal = Principal(
+        kind=PrincipalKind(principal_kind),
+        id=principal_id,
+        instance_id=principal_instance_id,
+    )
+
+    # Update relationship (same as old bootstrap for continuity)
+    relationship = await engine.relationships.upsert(
+        tenant_id=tenant_id,
+        principal_kind=principal.kind,
+        principal_id=principal.id,
+        principal_instance_id=principal.instance_id,
+    )
+
+    # Get open obligations (the new truth)
+    limit_value = min(
+        limit or 50,
+        200,
+    )
+    
+    obligations_data = await engine.list_open_obligations(
+        tenant_id=tenant_id,
+        principal=principal,
+        since_receipt_id=since_receipt_id,
+        limit=limit_value,
+    )
+
+    # Get config for server metadata
+    from asyncgate.config import settings
+    
+    return OpenObligationsResponse(
+        server={
+            "name": "AsyncGate",
+            "version": "0.1.0",
+            "instance_id": settings.instance_id,
+            "environment": settings.env.value,
+        },
+        relationship={
+            "principal_kind": relationship.principal_kind.value,
+            "principal_id": relationship.principal_id,
+            "principal_instance_id": relationship.principal_instance_id,
+            "first_seen_at": relationship.first_seen_at.isoformat(),
+            "last_seen_at": relationship.last_seen_at.isoformat(),
+            "sessions_count": relationship.sessions_count,
+        },
+        open_obligations=obligations_data["open_obligations"],
+        cursor=obligations_data.get("cursor"),
+    )
+
+
+# ============================================================================
+# Bootstrap (DEPRECATED - use /obligations/open)
 # ============================================================================
 
 
@@ -79,7 +159,22 @@ async def bootstrap(
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
 ):
-    """Bootstrap session and get attention-aware status."""
+    """
+    Bootstrap session and get attention-aware status.
+    
+    DEPRECATED: Use /v1/obligations/open instead.
+    This endpoint will be removed in a future version.
+    """
+    from fastapi import Response
+    from starlette.background import BackgroundTask
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        f"DEPRECATED: /v1/bootstrap called by principal {principal_kind}:{principal_id}. "
+        "Use /v1/obligations/open instead."
+    )
+    
     engine = AsyncGateEngine(session)
 
     principal = Principal(
@@ -88,11 +183,21 @@ async def bootstrap(
         instance_id=principal_instance_id,
     )
 
-    return await engine.bootstrap(
+    result = await engine.bootstrap(
         tenant_id=tenant_id,
         principal=principal,
         since_receipt_id=since_receipt_id,
         max_items=max_items,
+    )
+    
+    # Add deprecation header
+    return Response(
+        content=json.dumps(result),
+        media_type="application/json",
+        headers={
+            "X-AsyncGate-Deprecated": "Use /v1/obligations/open instead",
+            "Deprecation": "true",
+        },
     )
 
 

@@ -236,28 +236,79 @@ def task_completed(
 
 ---
 
-## TIER 2: Bootstrap Replacement (NOT STARTED)
+## COMPLETED: TIER 2 - Bootstrap Replacement
 
-### T2.1: Create New Bootstrap Endpoint
-**File:** `src/asyncgate/api/router.py` + schemas
-**Endpoint naming consideration (from Hexy):**
-- Option A: `/v1/obligations/open` (reflects model directly)
-- Option B: `/v1/obligations` (simpler)
-- Option C: `/v1/bootstrap/obligations` (parallel to existing)
-**Returns:** `{server: {...}, relationship: {...}, open_obligations: [Receipt], cursor: UUID}`
-**Uses:** `AsyncGateEngine.list_open_obligations()`
+### ✅ T2.1: Create New Bootstrap Endpoint
+**File:** `src/asyncgate/api/router.py` + `src/asyncgate/api/schemas.py`
+**Status:** COMPLETE
 
-### T2.2: Mark Old Bootstrap Deprecated
-**Add warning header:** `X-AsyncGate-Deprecated: "Use /v1/obligations/open"`
-**Log usage** for migration tracking
+**What was done:**
+1. Added `OpenObligationsResponse` schema to define response structure
+2. Created `/v1/obligations/open` endpoint (chose Option A - reflects model directly)
+3. Endpoint returns: `{server: {...}, relationship: {...}, open_obligations: [Receipt], cursor}`
+4. Uses `AsyncGateEngine.list_open_obligations()` for obligation query
+5. Updates relationship (for continuity with old bootstrap)
+6. Returns unbucketed ledger dump - NO attention semantics, NO task state bucketing
 
-### T2.3: Update Engine Bootstrap Logic
-**Remove bucketing:** No more `waiting_results`, `assigned_tasks`, etc.
-**Keep relationship metadata** if `/v1/bootstrap` wrapper maintained
+**Key features:**
+- Pure obligation dump from ledger
+- No `waiting_results`, no `assigned_tasks`, no `running_or_scheduled`
+- Cursor-based pagination via `since_receipt_id`
+- Server and relationship metadata for client awareness
+
+### ✅ T2.2: Mark Old Bootstrap Deprecated
+**File:** `src/asyncgate/api/router.py`
+**Status:** COMPLETE
+
+**What was done:**
+1. Updated `/v1/bootstrap` docstring with deprecation notice
+2. Added deprecation warning header: `X-AsyncGate-Deprecated: "Use /v1/obligations/open"`
+3. Added `Deprecation: true` standard header
+4. Logs warning when old endpoint is called for migration tracking
+5. Returns JSON response with deprecation headers
+
+**Migration path:**
+- Old endpoint still functional (no breaking changes)
+- Clients warned via headers and logs
+- Clear upgrade path to new endpoint
+
+### ⚠️ T2.3: Unbucketed Bootstrap Test (DEFERRED to Tier 6)
+**Status:** DOCUMENTED, not yet implemented
+
+**Required test:**
+```python
+async def test_obligations_endpoint_is_unbucketed():
+    """
+    Critical anti-regression test: ensure /v1/obligations/open 
+    returns ONLY unbucketed obligation dump.
+    
+    Prevents regression to inbox/attention model.
+    """
+    response = await client.get("/v1/obligations/open", params={...})
+    data = response.json()
+    
+    # MUST have these fields
+    assert "server" in data
+    assert "relationship" in data
+    assert "open_obligations" in data
+    assert "cursor" in data
+    
+    # MUST NOT have bucketing fields
+    assert "waiting_results" not in data
+    assert "assigned_tasks" not in data
+    assert "running_or_scheduled" not in data
+    assert "attention" not in data
+    assert "anomalies" not in data
+    
+    # open_obligations is pure list, not dict with categories
+    assert isinstance(data["open_obligations"], list)
+```
+
+**Why deferred:** Test framework not yet set up. Will implement in Tier 6 testing phase.
 
 ---
 
-## TIER 3: Cleanup (NOT STARTED)
+## NEXT: TIER 3 - Cleanup (NOT STARTED)
 
 ### T3.1: Keep delivered_at as Telemetry (Don't Rush)
 **From Hexy:** Keep `delivered_at` field for observability

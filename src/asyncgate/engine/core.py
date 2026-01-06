@@ -804,6 +804,7 @@ class AsyncGateEngine:
             to_principal=to_principal,
             lease_id=lease_id,
             body=body,
+            parents=parents,  # P0.5: Include parents in hash
         )
 
         return await self.receipts.create(
@@ -849,14 +850,19 @@ class AsyncGateEngine:
         to_principal: Principal,
         lease_id: UUID | None,
         body: dict[str, Any] | None,
+        parents: list[UUID] | None,  # P0.5: Include parents in hash
     ) -> str:
         """
         Compute hash for receipt deduplication.
         
-        Includes all fields that make a receipt unique to prevent collisions:
+        P0.5: Parents are now included in hash to prevent collisions
+        where same body but different parents would dedupe incorrectly.
+        
+        Includes all fields that make a receipt unique:
         - receipt_type, task_id, lease_id
         - from (kind + id)
-        - to (kind + id) 
+        - to (kind + id)
+        - parents (sorted list of UUID strings)
         - body (canonical JSON)
         
         Returns full 64-character SHA256 hex digest.
@@ -864,10 +870,11 @@ class AsyncGateEngine:
         # Create canonical body hash if body exists
         body_hash = None
         if body:
-            body_canonical = json.dumps(body, sort_keys=True)
+            # P1.3: Use canonical JSON with separators for stability
+            body_canonical = json.dumps(body, sort_keys=True, separators=(',', ':'))
             body_hash = hashlib.sha256(body_canonical.encode()).hexdigest()
         
-        # Build receipt key from all identifying fields
+        # Build receipt key from all identifying fields INCLUDING PARENTS
         data = {
             "receipt_type": receipt_type.value,
             "task_id": str(task_id) if task_id else None,
@@ -876,9 +883,11 @@ class AsyncGateEngine:
             "to_kind": to_principal.kind.value,
             "to_id": to_principal.id,
             "lease_id": str(lease_id) if lease_id else None,
+            "parents": sorted([str(p) for p in (parents or [])]),  # P0.5: Include parents
             "body_hash": body_hash,
         }
-        content = json.dumps(data, sort_keys=True)
+        # P1.3: Use canonical JSON serialization
+        content = json.dumps(data, sort_keys=True, separators=(',', ':'))
         # Return full 64-char hex digest (no truncation)
         return hashlib.sha256(content.encode()).hexdigest()
 

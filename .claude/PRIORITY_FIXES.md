@@ -674,13 +674,23 @@ async def test_receipt_hash_includes_parents():
   - Tests: `tests/test_p01_batch_termination.py`
   - Performance: 60M rows → 200 rows with 100K receipts
 - [ ] P0.2: Atomic transactions
-- [ ] P0.3: CORS
-- [ ] P0.4: Rate limiting
+- [x] **P0.3: CORS** ✅ COMPLETE (Commit 3bd7f82)
+  - Explicit `cors_allowed_origins` config (no wildcards)
+  - Default: localhost:3000, localhost:8080
+  - Explicit methods/headers (no wildcards)
+  - Migration guide: `docs/P03_P04_MIGRATION.md`
+  - Tests: `tests/test_p03_p04_security_config.py`
+- [x] **P0.4: Rate limiting** ✅ COMPLETE (Commit 3bd7f82)
+  - Default: `True` (was `False`)
+  - Forced ON in staging/production
+  - Property: `rate_limit_active`
+  - Tests: Environment-based override verification
 - [ ] P0.5: Hash parents
 - [ ] P1.1: Renewal limits
 - [ ] P1.2: Timezone
 - [ ] P1.3: Hash canon
 
 **Target:** All P0 fixes within 5 days  
-**Progress:** 1/5 P0 complete (20%)
+**Progress:** 3/5 P0 complete (60%)  
+**Remaining:** P0.2 (6-8h), P0.5 (2-3h) = 8-11 hours
 

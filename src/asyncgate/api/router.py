@@ -191,8 +191,10 @@ async def bootstrap(
     )
     
     # Add deprecation header
+    from fastapi.encoders import jsonable_encoder
+    
     return Response(
-        content=json.dumps(result),
+        content=json.dumps(jsonable_encoder(result)),
         media_type="application/json",
         headers={
             "X-AsyncGate-Deprecated": "Use /v1/obligations/open instead",

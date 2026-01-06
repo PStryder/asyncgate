@@ -85,7 +85,9 @@ async def verify_api_key(
         raise HTTPException(status_code=401, detail="Invalid authorization format")
 
     token = authorization[7:]
-    if token != settings.api_key:
+    
+    import secrets
+    if not secrets.compare_digest(token, settings.api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True

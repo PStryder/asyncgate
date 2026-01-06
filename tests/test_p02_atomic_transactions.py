@@ -241,14 +241,14 @@ async def test_expire_leases_atomicity(session: AsyncSession):
     await session.commit()
     
     # Expire the lease manually (set expires_at to past)
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from asyncgate.db.tables import LeaseTable
     from sqlalchemy import update
     
     await session.execute(
         update(LeaseTable)
         .where(LeaseTable.lease_id == lease.lease_id)
-        .values(expires_at=datetime.utcnow() - timedelta(seconds=10))
+        .values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=10))
     )
     await session.commit()
     

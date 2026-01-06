@@ -679,6 +679,8 @@ class ReceiptRepository:
         # T1.2: Enforce locatability on success terminal receipts (Phase 1 - lenient)
         # If success without locatability: strip parents so obligation stays open, emit anomaly
         parents_to_use = parents
+        emit_locatability_anomaly = False
+        
         if receipt_type == ReceiptType.TASK_COMPLETED:
             body_data = body or {}
             has_artifacts = body_data.get('artifacts') is not None
@@ -688,15 +690,14 @@ class ReceiptRepository:
                 # Phase 1 (lenient): Allow creation but strip parents
                 # This keeps obligation open until proper locatable receipt created
                 parents_to_use = []
+                emit_locatability_anomaly = True
                 
-                # TODO: Emit system.anomaly receipt
-                # For now, just log it
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.warning(
                     f"SUCCESS WITHOUT LOCATABILITY: Receipt {receipt_id} for task {task_id} "
                     f"lacks artifacts or delivery_proof. Parents stripped - obligation stays open. "
-                    f"Producer must fix and resend with locatability."
+                    f"Emitting anomaly receipt to principal."
                 )
                 
                 # In Phase 2 (strict), this would raise ValueError instead
@@ -721,6 +722,36 @@ class ReceiptRepository:
 
         self.session.add(receipt_row)
         await self.session.flush()
+        
+        # Emit anomaly receipt if locatability was missing
+        if emit_locatability_anomaly:
+            anomaly_receipt = ReceiptTable(
+                tenant_id=tenant_id,
+                receipt_id=uuid4(),
+                receipt_type=ReceiptType.SYSTEM_ANOMALY,
+                created_at=datetime.now(timezone.utc),
+                from_kind=PrincipalKind.SYSTEM,
+                from_id="asyncgate",
+                to_kind=to_principal.kind,
+                to_id=to_principal.id,
+                task_id=task_id,
+                lease_id=None,
+                schedule_id=None,
+                parents=[str(receipt_id)],  # References the stripped-parent receipt
+                body={
+                    "anomaly_type": "locatability_missing",
+                    "message": (
+                        f"Success receipt {receipt_id} lacks locatability (no artifacts or delivery_proof). "
+                        "Obligation remains open until properly locatable success is provided."
+                    ),
+                    "original_receipt_id": str(receipt_id),
+                    "stripped_parents": [str(p) for p in (parents or [])],
+                },
+                hash=None,
+                asyncgate_instance=settings.instance_id,
+            )
+            self.session.add(anomaly_receipt)
+            await self.session.flush()
 
         return self._row_to_model(receipt_row)
 

@@ -81,14 +81,23 @@ fly deploy
 
 ### REST Endpoints
 
+#### Health & Config
+
+- `GET /v1/health` - Health check endpoint
+- `GET /v1/config` - Get server configuration
+
+#### Obligations (Canonical Bootstrap)
+
+- `GET /v1/obligations/open` - Get open obligations for a principal (ledger dump, no bucketing)
+
 #### TASKER (Agent) Endpoints
 
-- `GET /v1/bootstrap` - Establish session and get attention-aware status
+- `GET /v1/bootstrap` - **DEPRECATED**: Use `/v1/obligations/open` instead
 - `POST /v1/tasks` - Create a new task
 - `GET /v1/tasks/{task_id}` - Get task by ID
 - `GET /v1/tasks` - List tasks
 - `POST /v1/tasks/{task_id}/cancel` - Cancel a task
-- `GET /v1/receipts` - List receipts
+- `GET /v1/receipts` - List receipts for a principal
 - `POST /v1/receipts/{receipt_id}/ack` - Acknowledge a receipt
 
 #### TASKEE (Worker) Endpoints
@@ -126,16 +135,29 @@ Environment variables (prefix `ASYNCGATE_`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | - | PostgreSQL connection URL |
+| `DATABASE_URL` | postgresql+asyncpg://... | PostgreSQL connection URL |
 | `REDIS_URL` | - | Redis URL for rate limiting |
 | `ENV` | development | Environment (development/staging/production) |
 | `INSTANCE_ID` | asyncgate-1 | Instance identifier |
 | `LOG_LEVEL` | INFO | Logging level |
+| `DEBUG` | false | Debug mode |
 | `DEFAULT_LEASE_TTL_SECONDS` | 120 | Default lease TTL |
+| `MAX_LEASE_TTL_SECONDS` | 1800 | Maximum lease TTL (30 min) |
+| `MAX_LEASE_RENEWALS` | 10 | Maximum lease renewals before forced release |
+| `MAX_LEASE_LIFETIME_SECONDS` | 7200 | Absolute max lease lifetime (2 hours) |
 | `DEFAULT_MAX_ATTEMPTS` | 2 | Default max retry attempts |
-| `RECEIPT_MODE` | standalone | Receipt storage mode |
+| `DEFAULT_RETRY_BACKOFF_SECONDS` | 15 | Default retry backoff |
+| `RECEIPT_MODE` | standalone | Receipt storage mode (standalone/memorygate_integrated) |
+| `API_KEY` | - | API key for authentication |
+| `ALLOW_INSECURE_DEV` | false | Allow unauthenticated in dev mode |
+| `RATE_LIMIT_ENABLED` | true | Enable rate limiting |
+| `RATE_LIMIT_BACKEND` | memory | Rate limit backend (memory/redis) |
+| `RATE_LIMIT_DEFAULT_CALLS` | 100 | Default calls per window |
+| `RATE_LIMIT_DEFAULT_WINDOW_SECONDS` | 60 | Rate limit window size |
 
 ## Task Lifecycle
+
+States: `queued`, `leased`, `succeeded`, `failed`, `canceled`
 
 ```
 queued -> leased -> succeeded
@@ -151,6 +173,8 @@ queued -> leased -> succeeded
 - `queued/leased -> canceled`: Task canceled
 - `failed -> queued`: Retry with backoff (if attempts remaining)
 - `leased -> queued`: Lease expires (system-driven)
+
+Terminal states: `succeeded`, `failed`, `canceled`
 
 ## Invariants
 

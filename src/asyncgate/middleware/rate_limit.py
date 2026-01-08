@@ -227,21 +227,32 @@ class RateLimiter:
         if key_override:
             key = key_override
         else:
-            # P1-4: When auth is enabled, key by API key hash to prevent tenant spoofing
-            # In insecure dev mode, fall back to tenant_id/IP for convenience
-            auth_enabled = settings.api_key and not settings.allow_insecure_dev
-            
+            # P1-4: When auth is enabled, key by API key hash to prevent tenant spoofing.
+            # In insecure dev mode, fall back to tenant_id/IP for convenience.
+            auth_enabled = not settings.allow_insecure_dev
+
             if auth_enabled:
-                # Auth enabled: Use API key hash (prevents tenant ID spoofing)
-                import hashlib
-                key_hash = hashlib.sha256(settings.api_key.encode()).hexdigest()[:16]
-                key = f"{rule.key_prefix}auth:{key_hash}"
+                api_key = None
+                auth_header = request.headers.get("Authorization")
+                if auth_header and auth_header.startswith("Bearer "):
+                    api_key = auth_header[7:]
+                elif request.headers.get("X-API-Key"):
+                    api_key = request.headers.get("X-API-Key")
+
+                if api_key:
+                    import hashlib
+                    key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+                    key = f"{rule.key_prefix}auth:{key_hash}"
+                else:
+                    # Auth required but missing header; still rate limit by IP.
+                    client_ip = request.client.host if request.client else "unknown"
+                    key = f"{rule.key_prefix}ip:{client_ip}"
             else:
                 # Insecure dev mode: Try tenant_id from query/header, fall back to client IP
                 tenant_id = request.query_params.get("tenant_id")
                 if not tenant_id:
                     tenant_id = request.headers.get("X-Tenant-ID")
-                
+
                 if tenant_id:
                     key = f"{rule.key_prefix}tenant:{tenant_id}"
                 else:

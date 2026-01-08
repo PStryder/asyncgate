@@ -9,6 +9,8 @@ from asyncgate.db.tables import (
     AuditEventTable,
     RelationshipTable,
 )
+# Import auth models to register them with SQLAlchemy metadata
+from asyncgate.auth.models import User, APIKey
 
 __all__ = [
     "Base",
@@ -20,4 +22,6 @@ __all__ = [
     "ProgressTable",
     "AuditEventTable",
     "RelationshipTable",
+    "User",
+    "APIKey",
 ]

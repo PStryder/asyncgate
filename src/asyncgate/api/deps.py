@@ -1,7 +1,8 @@
 """API dependencies."""
 
 import logging
-from typing import AsyncGenerator
+import secrets
+from typing import AsyncGenerator, Optional
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException
@@ -49,54 +50,77 @@ async def get_tenant_id(
 
 async def verify_api_key(
     authorization: str | None = Header(None),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    session: AsyncSession = Depends(get_db_session),
 ) -> bool:
     """
     Verify API key authentication.
 
-    In v0, we use simple shared token.
-    In production, this would validate JWTs or API keys.
-    
-    Security: Fails closed - if api_key is not configured and we're not
+    Supports two modes:
+    1. Database-backed API keys (ag_... prefix) - validates against auth_api_keys table
+    2. Legacy shared token (ASYNCGATE_API_KEY env var) - for backward compatibility
+
+    Security: Fails closed - if neither mode is configured and we're not
     in explicit insecure dev mode, all requests are rejected.
     """
+    from asyncgate.auth.middleware import verify_request_api_key, API_KEY_PREFIX
+
     # Insecure dev mode bypass (must be explicitly enabled)
-    # Note: Startup warning is logged by validate_auth_config()
     if settings.allow_insecure_dev and settings.env == Environment.DEVELOPMENT:
         return True
 
-    # SECURITY: Fail closed if api_key not configured
-    if not settings.api_key:
-        logger.error(
-            "SECURITY VIOLATION: api_key not configured and insecure mode disabled. "
-            "Set ASYNCGATE_API_KEY or enable ASYNCGATE_ALLOW_INSECURE_DEV=true (dev only)."
-        )
+    # Extract API key from headers
+    api_key = None
+    if authorization and authorization.startswith("Bearer "):
+        api_key = authorization[7:]
+    elif x_api_key:
+        api_key = x_api_key
+
+    if not api_key:
         raise HTTPException(
-            status_code=503,
-            detail="Server misconfigured: authentication not properly initialized",
+            status_code=401,
+            detail="Missing authorization. Use Authorization: Bearer <key> or X-API-Key header"
         )
 
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
+    # Check if it's a database-backed API key (ag_ prefix)
+    if api_key.startswith(API_KEY_PREFIX):
+        headers = {}
+        if authorization:
+            headers["authorization"] = authorization
+        if x_api_key:
+            headers["x-api-key"] = x_api_key
 
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization format")
-
-    token = authorization[7:]
-    
-    import secrets
-    if not secrets.compare_digest(token, settings.api_key):
+        user = await verify_request_api_key(session, headers)
+        if user:
+            if not user.is_active:
+                raise HTTPException(status_code=403, detail="User account is inactive")
+            return True
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    return True
+    # Fallback: Legacy shared token validation
+    if settings.api_key:
+        if secrets.compare_digest(api_key, settings.api_key):
+            return True
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # No valid auth method configured
+    logger.error(
+        "SECURITY VIOLATION: No API key configured (neither database keys nor legacy token). "
+        "Set ASYNCGATE_API_KEY or create database API keys."
+    )
+    raise HTTPException(
+        status_code=503,
+        detail="Server misconfigured: authentication not properly initialized",
+    )
 
 
 def validate_auth_config() -> None:
     """
     Validate authentication configuration at startup.
-    
+
     Ensures server cannot start with insecure configuration in non-dev environments.
     This prevents the footgun where missing api_key accidentally runs open.
-    
+
     Raises:
         RuntimeError: If configuration is insecure for the current environment
     """
@@ -107,15 +131,15 @@ def validate_auth_config() -> None:
             f"Current environment: {settings.env.value}. "
             f"Set ASYNCGATE_ALLOW_INSECURE_DEV=false for {settings.env.value}."
         )
-    
-    # If not in insecure dev mode, api_key must be configured
+
+    # In non-insecure mode, we need either legacy API key or database auth
+    # Note: Database auth doesn't require config - keys are created via admin API
     if not settings.allow_insecure_dev and not settings.api_key:
-        raise RuntimeError(
-            f"SECURITY ERROR: api_key is required in {settings.env.value} environment. "
-            f"Set ASYNCGATE_API_KEY to a secure token. "
-            f"For local development only, you can set ASYNCGATE_ALLOW_INSECURE_DEV=true."
+        logger.info(
+            f"No legacy ASYNCGATE_API_KEY configured. "
+            f"Database-backed API keys (ag_...) will be required for authentication."
         )
-    
+
     # Log security status
     if settings.allow_insecure_dev:
         logger.warning(
@@ -129,5 +153,9 @@ def validate_auth_config() -> None:
         )
     elif settings.api_key:
         logger.info(
-            f"Authentication enabled: API key configured for {settings.env.value} environment"
+            f"Authentication enabled: Legacy API key + database keys for {settings.env.value}"
+        )
+    else:
+        logger.info(
+            f"Authentication enabled: Database-backed API keys only for {settings.env.value}"
         )

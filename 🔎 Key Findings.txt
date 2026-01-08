@@ -1,0 +1,68 @@
+🔎 Key Findings
+1) Idempotent task creation still emits duplicate side effects (receipts)
+Severity: High (correctness / downstream duplication)
+TaskRepository.create() returns an existing task when the idempotency key collides, but AsyncGateEngine.create_task() always emits a new task.assigned receipt regardless. This can create duplicate obligations/receipts for the same task whenever callers retry with the same idempotency key.
+Recommendation: Have create() return a (task, created) flag or check for idempotency-key hits and suppress duplicate receipt emission in the engine.
+Evidence: TaskRepository.create() handles idempotency collisions by returning an existing task. AsyncGateEngine.create_task() always emits a receipt after creation with no “created” check.
+
+2) Rate limiting can be spoofed or overly global with DB-backed API keys
+Severity: High (security / abuse prevention)
+The rate limiter hashes the legacy shared token (settings.api_key) rather than the request’s API key, and falls back to tenant ID / IP when settings.api_key is absent. This means:
+
+With DB-backed API keys (ag_...), the rate limiter may key by tenant header or IP even though auth is enabled, allowing tenant spoofing and per-tenant bypass.
+
+With legacy shared tokens, all callers share a single global rate limit.
+Recommendation: Extract the API key from the incoming request (or resolved user ID) and key rate limits per key/user; enforce tenant scoping when auth is on.
+Evidence: Rate limiter hashes settings.api_key (not per-request) and otherwise uses tenant header/IP, even in auth-enabled contexts. Authentication explicitly supports DB-backed API keys (ag_...) where settings.api_key can be unset.
+
+3) Lease renewal limit errors bubble as 500s
+Severity: Medium (reliability / API contract)
+LeaseRepository.renew() raises LeaseRenewalLimitExceeded and LeaseLifetimeExceeded, but the engine and router only handle TaskNotFound and LeaseInvalidOrExpired, so these limit errors produce unhandled exceptions (500s).
+Recommendation: Catch and map these lease-limit exceptions to 400/409 responses with clear error messages.
+Evidence: Lease renewal explicitly raises the limit exceptions. Engine renew_lease() doesn’t handle them. Router catches only TaskNotFound and LeaseInvalidOrExpired.
+
+4) Invalid enum values cause 500s instead of validation errors
+Severity: Medium (robustness / API hygiene)
+Endpoints accept principal_kind, to_kind, and status as raw strings, then construct enums directly inside the engine/router. Invalid values raise ValueError, which is not caught, leading to 500 responses.
+Recommendation: Use Pydantic enums at the request/Query layer so invalid values return 422, or wrap conversions with explicit error handling.
+Evidence: Enum parsing occurs without validation for task creation and other endpoints. list_tasks() converts status to TaskStatus without exception handling.
+
+5) Tenant isolation is not enforced by authentication
+Severity: High (security / multi-tenant boundary)
+X-Tenant-ID is accepted as the tenant selector, but API keys are not tied to a tenant, and there is no authorization check binding the key/user to the tenant. Any valid API key can request any tenant’s data by changing headers.
+Recommendation: Bind API keys to tenant(s) in the DB and enforce that the incoming tenant matches the key’s tenant claims; ideally derive tenant from auth instead of headers.
+Evidence: Tenant ID is taken directly from header without tying it to the authenticated user/key. Auth models and API keys have no tenant relationship fields.
+
+6) MemoryGate integration is configured but not implemented
+Severity: Medium (functional gap / misleading config)
+Configuration supports receipt_mode = MEMORYGATE_INTEGRATED, but the MemoryGate client only logs and returns a placeholder response; buffering and retry are TODOs. There is also no code path in the engine that switches behavior based on receipt_mode. This risks silent non-delivery when operators believe integration is active.
+Recommendation: Either implement and wire the integration, or reject startup/config when receipt_mode is set to MEMORYGATE_INTEGRATED without implementation.
+Evidence: MemoryGate integration settings exist in config. MemoryGate client is explicitly a placeholder with TODOs for HTTP and retry buffer.
+
+✅ Notable Strengths
+Task creation uses DB-first idempotency to avoid race conditions on duplicate requests.
+
+Lease renewal includes anti-hoarding limits for renewal count and absolute lifetime, improving system stability under abuse or misbehaving workers.
+
+Receipt integrity and size constraints help prevent ledger bloat and abuse (body size, parent count, artifacts count).
+
+🧾 Command Log (for review evidence)
+rg "TODO|FIXME|HACK" -n src tests workers docs README.md DEVELOPMENT.md SYSTEM_BOUNDARY.md
+
+sed -n '1,200p' src/asyncgate/engine/core.py
+
+sed -n '1,200p' src/asyncgate/api/deps.py
+
+sed -n '1,220p' src/asyncgate/api/router.py
+
+sed -n '180,340p' src/asyncgate/middleware/rate_limit.py
+
+sed -n '420,560p' src/asyncgate/db/repositories.py
+
+sed -n '70,180p' src/asyncgate/integrations/memorygate_client.py
+
+sed -n '1,200p' src/asyncgate/auth/models.py
+
+sed -n '1,140p' src/asyncgate/config.py
+
+If you'd like, I can propose specific fixes or prepare patches for the highest-risk items (tenant isolation, idempotency side effects, and rate limiting keying).

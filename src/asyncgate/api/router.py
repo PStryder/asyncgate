@@ -57,7 +57,13 @@ router = APIRouter(
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
-    return HealthResponse(status="healthy", version="0.1.0")
+    from asyncgate.config import settings
+    return HealthResponse(
+        status="healthy",
+        service="AsyncGate",
+        version="0.1.0",
+        instance_id=settings.instance_id
+    )
 
 
 @router.get("/config", response_model=ConfigResponse)

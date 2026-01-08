@@ -235,7 +235,9 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str
+    service: str = "AsyncGate"
     version: str
+    instance_id: str
 
 
 class ConfigResponse(BaseModel):

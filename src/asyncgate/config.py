@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -163,6 +163,49 @@ class Settings(BaseSettings):
     # Server
     host: str = "0.0.0.0"
     port: int = 8080
+
+    # Validators
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        """Validate PostgreSQL database URL format."""
+        if not v.startswith(("postgresql://", "postgresql+asyncpg://")):
+            raise ValueError("database_url must be a PostgreSQL URL (postgresql:// or postgresql+asyncpg://)")
+        return v
+
+    @field_validator("port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        """Validate port number range."""
+        if not 1 <= v <= 65535:
+            raise ValueError(f"Port must be between 1 and 65535, got {v}")
+        return v
+
+    @field_validator("memorygate_url", "redis_url")
+    @classmethod
+    def validate_integration_url(cls, v: Optional[str]) -> Optional[str]:
+        """Validate integration URLs are HTTP(S) or redis://."""
+        if v:
+            if not v.startswith(("http://", "https://", "redis://", "rediss://")):
+                raise ValueError(f"URL must start with http://, https://, redis://, or rediss://, got {v}")
+        return v
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, v: Optional[str], info) -> Optional[str]:
+        """Validate API key is set when auth is required."""
+        allow_insecure = info.data.get("allow_insecure_dev", False)
+        env = info.data.get("env")
+        
+        # Production/staging must have api_key
+        if env in [Environment.PRODUCTION, Environment.STAGING] and not v:
+            raise ValueError(f"api_key is required in {env.value} environment")
+        
+        # Dev without api_key requires explicit allow_insecure_dev
+        if not v and not allow_insecure:
+            raise ValueError("api_key is required when allow_insecure_dev=False")
+        
+        return v
 
 
 settings = Settings()

@@ -10,6 +10,7 @@ This worker demonstrates the AsyncGate lease protocol by:
 """
 
 import asyncio
+import shlex
 import subprocess
 import json
 import sys
@@ -27,13 +28,20 @@ class CommandExecutorWorker:
         asyncgate_url: str,
         api_key: str,
         worker_id: str,
-        poll_interval_seconds: int = 1
+        poll_interval_seconds: int = 1,
+        allow_shell: bool = False,
+        allowed_commands: Optional[list[str]] = None,
+        output_base_dir: str = "./outputs"
     ):
         self.asyncgate_url = asyncgate_url.rstrip('/')
         self.api_key = api_key
         self.worker_id = worker_id
         self.poll_interval = poll_interval_seconds
         self.capabilities = ["command.execute"]
+        self.allow_shell = allow_shell
+        self.allowed_commands = [c for c in (allowed_commands or []) if c]
+        self.output_base_dir = Path(output_base_dir).resolve()
+        self.output_base_dir.mkdir(parents=True, exist_ok=True)
         
         self.headers = {
             "Authorization": f"Bearer {api_key}",
@@ -44,6 +52,36 @@ class CommandExecutorWorker:
         """Simple logging"""
         timestamp = datetime.utcnow().isoformat()
         print(f"[{timestamp}] [{level}] [{self.worker_id}] {message}", flush=True)
+
+    def _normalize_command(self, command: str) -> str | list[str]:
+        """Normalize command execution input and enforce safety."""
+        if not command or not command.strip():
+            raise ValueError("Command is empty")
+
+        if self.allow_shell:
+            return command
+
+        if not self.allowed_commands:
+            raise ValueError(
+                "No allowed commands configured. Use --allowed-command or --allow-shell."
+            )
+
+        args = shlex.split(command)
+        if not args:
+            raise ValueError("Command is empty after parsing")
+        if args[0] not in self.allowed_commands:
+            raise ValueError(f"Command not allowed: {args[0]}")
+        return args
+
+    def _resolve_output_path(self, output_path: str) -> Path:
+        """Resolve output path inside the base directory."""
+        candidate = Path(output_path)
+        resolved = candidate.resolve() if candidate.is_absolute() else (self.output_base_dir / candidate).resolve()
+        try:
+            resolved.relative_to(self.output_base_dir)
+        except ValueError:
+            raise ValueError("output_path must be within the configured output base directory")
+        return resolved
     
     async def poll_for_task(self) -> Optional[Dict[str, Any]]:
         """Poll AsyncGate for available tasks matching our capabilities"""
@@ -124,10 +162,11 @@ class CommandExecutorWorker:
         self.log(f"Executing command: {command}")
         
         try:
+            cmd = self._normalize_command(command)
             # Execute command
             result = subprocess.run(
-                command,
-                shell=True,
+                cmd,
+                shell=self.allow_shell,
                 capture_output=True,
                 text=True,
                 timeout=300  # 5 minute timeout
@@ -143,7 +182,7 @@ class CommandExecutorWorker:
             }
             
             # Write to output path
-            output_file = Path(output_path)
+            output_file = self._resolve_output_path(output_path)
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
             with open(output_file, 'w') as f:
@@ -273,6 +312,23 @@ def main():
         default=1,
         help="Polling interval in seconds (default: 1)"
     )
+    parser.add_argument(
+        "--allow-shell",
+        action="store_true",
+        help="Allow shell execution (unsafe). Default: disabled."
+    )
+    parser.add_argument(
+        "--allowed-command",
+        action="append",
+        dest="allowed_commands",
+        default=[],
+        help="Allowlisted command name (repeatable)."
+    )
+    parser.add_argument(
+        "--output-base-dir",
+        default="./outputs",
+        help="Base directory for output artifacts (default: ./outputs)"
+    )
     
     args = parser.parse_args()
     
@@ -280,7 +336,10 @@ def main():
         asyncgate_url=args.asyncgate_url,
         api_key=args.api_key,
         worker_id=args.worker_id,
-        poll_interval_seconds=args.poll_interval
+        poll_interval_seconds=args.poll_interval,
+        allow_shell=args.allow_shell,
+        allowed_commands=args.allowed_commands,
+        output_base_dir=args.output_base_dir
     )
     
     asyncio.run(worker.run())

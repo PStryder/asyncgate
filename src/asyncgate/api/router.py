@@ -38,6 +38,8 @@ from asyncgate.engine import (
     AsyncGateEngine,
     InvalidStateTransition,
     LeaseInvalidOrExpired,
+    LeaseLifetimeExceeded,
+    LeaseRenewalLimitExceeded,
     TaskNotFound,
     UnauthorizedError,
 )
@@ -439,6 +441,10 @@ async def renew_lease(
         return RenewLeaseResponse(**result)
     except (TaskNotFound, LeaseInvalidOrExpired) as e:
         raise HTTPException(status_code=400, detail=e.message)
+    except LeaseRenewalLimitExceeded as e:
+        raise HTTPException(status_code=409, detail=e.message)
+    except LeaseLifetimeExceeded as e:
+        raise HTTPException(status_code=409, detail=e.message)
 
 
 @router.post("/tasks/{task_id}/progress", response_model=ReportProgressResponse)

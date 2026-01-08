@@ -42,11 +42,31 @@ from asyncgate.engine import (
     UnauthorizedError,
 )
 from asyncgate.models import Principal, PrincipalKind
+from asyncgate.models.enums import TaskStatus
 
 router = APIRouter(
     prefix="/v1",
     dependencies=[Depends(verify_api_key), Depends(rate_limit_dependency)],
 )
+
+
+def parse_principal_kind(value: str) -> PrincipalKind:
+    """Parse principal kind or raise HTTP 400 on invalid value."""
+    try:
+        return PrincipalKind(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid principal_kind: {value}")
+
+
+def validate_task_status(value: Optional[str]) -> Optional[str]:
+    """Validate task status or raise HTTP 400 on invalid value."""
+    if value is None:
+        return None
+    try:
+        TaskStatus(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {value}")
+    return value
 
 
 # ============================================================================
@@ -105,7 +125,7 @@ async def get_open_obligations(
     engine = AsyncGateEngine(session)
 
     principal = Principal(
-        kind=PrincipalKind(principal_kind),
+        kind=parse_principal_kind(principal_kind),
         id=principal_id,
         instance_id=principal_instance_id,
     )
@@ -188,7 +208,7 @@ async def bootstrap(
     engine = AsyncGateEngine(session)
 
     principal = Principal(
-        kind=PrincipalKind(principal_kind),
+        kind=parse_principal_kind(principal_kind),
         id=principal_id,
         instance_id=principal_instance_id,
     )
@@ -230,7 +250,7 @@ async def create_task(
     engine = AsyncGateEngine(session)
 
     created_by = Principal(
-        kind=PrincipalKind(principal_kind),
+        kind=parse_principal_kind(principal_kind),
         id=principal_id,
     )
 
@@ -278,6 +298,7 @@ async def list_tasks(
     """List tasks with optional filtering."""
     engine = AsyncGateEngine(session)
 
+    status = validate_task_status(status)
     result = await engine.list_tasks(
         tenant_id=tenant_id,
         status=status,
@@ -301,7 +322,7 @@ async def cancel_task(
     engine = AsyncGateEngine(session)
 
     principal = Principal(
-        kind=PrincipalKind(request.principal_kind),
+        kind=parse_principal_kind(request.principal_kind),
         id=request.principal_id,
     )
 
@@ -336,6 +357,7 @@ async def list_receipts(
     """List receipts for a principal."""
     engine = AsyncGateEngine(session)
 
+    _ = parse_principal_kind(to_kind)
     result = await engine.list_receipts(
         tenant_id=tenant_id,
         to_kind=to_kind,
@@ -358,7 +380,7 @@ async def ack_receipt(
     engine = AsyncGateEngine(session)
 
     principal = Principal(
-        kind=PrincipalKind(request.principal_kind),
+        kind=parse_principal_kind(request.principal_kind),
         id=request.principal_id,
     )
 

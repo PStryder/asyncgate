@@ -18,7 +18,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
-import requests
+import httpx
 from uuid import uuid4
 
 
@@ -47,11 +47,16 @@ class CommandExecutorWorker:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
+        self._client = httpx.AsyncClient(timeout=10.0)
     
     def log(self, message: str, level: str = "INFO"):
         """Simple logging"""
         timestamp = datetime.utcnow().isoformat()
         print(f"[{timestamp}] [{level}] [{self.worker_id}] {message}", flush=True)
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        await self._client.aclose()
 
     def _normalize_command(self, command: str) -> str | list[str]:
         """Normalize command execution input and enforce safety."""
@@ -86,76 +91,34 @@ class CommandExecutorWorker:
     async def poll_for_task(self) -> Optional[Dict[str, Any]]:
         """Poll AsyncGate for available tasks matching our capabilities"""
         try:
-            response = requests.post(
-                f"{self.asyncgate_url}/v1/lease",
+            response = await self._client.post(
+                f"{self.asyncgate_url}/v1/leases/claim",
                 headers=self.headers,
                 json={
                     "worker_id": self.worker_id,
-                    "capabilities": self.capabilities
+                    "capabilities": self.capabilities,
+                    "max_tasks": 1
                 },
-                timeout=5
             )
-            
+
             if response.status_code == 204:
-                # No tasks available
                 return None
-            
+
             if response.status_code == 200:
-                task = response.json()
+                data = response.json()
+                tasks = data.get("tasks", [])
+                if not tasks:
+                    return None
+                task = tasks[0]
                 self.log(f"Received task: {task.get('task_id')}")
                 return task
-            
+
             self.log(f"Unexpected response from lease: {response.status_code}", "WARN")
             return None
             
         except Exception as e:
             self.log(f"Error polling for task: {e}", "ERROR")
             return None
-    
-    def emit_receipt(self, receipt_type: str, parent_receipt_ids: list, body: dict, artifacts: list = None):
-        """Emit a receipt to AsyncGate"""
-        try:
-            receipt = {
-                "receipt_type": receipt_type,
-                "parent_receipt_ids": parent_receipt_ids,
-                "body": body
-            }
-            
-            if artifacts:
-                receipt["artifacts"] = artifacts
-            
-            response = requests.post(
-                f"{self.asyncgate_url}/v1/receipts",
-                headers=self.headers,
-                json=receipt,
-                timeout=5
-            )
-            
-            if response.status_code == 201:
-                receipt_id = response.json().get("receipt_id")
-                self.log(f"Emitted {receipt_type} receipt: {receipt_id}")
-                return receipt_id
-            else:
-                self.log(f"Failed to emit receipt: {response.status_code} - {response.text}", "ERROR")
-                return None
-                
-        except Exception as e:
-            self.log(f"Error emitting receipt: {e}", "ERROR")
-            return None
-    
-    def accept_task(self, task: Dict[str, Any]) -> Optional[str]:
-        """Emit accepted receipt for task"""
-        task_id = task.get("task_id")
-        queued_receipt_id = task.get("receipt_id")  # The queued receipt is the parent
-        
-        return self.emit_receipt(
-            receipt_type="accepted",
-            parent_receipt_ids=[queued_receipt_id],
-            body={
-                "worker_id": self.worker_id,
-                "accepted_at": datetime.utcnow().isoformat()
-            }
-        )
     
     def execute_command(self, command: str, output_path: str) -> Dict[str, Any]:
         """Execute shell command and write output to file"""
@@ -209,57 +172,76 @@ class CommandExecutorWorker:
                 "error": str(e)
             }
     
-    def report_completion(self, accepted_receipt_id: str, execution_result: Dict[str, Any]):
-        """Emit success or failure receipt based on execution result"""
+    async def report_completion(
+        self,
+        task_id: str,
+        lease_id: str,
+        execution_result: Dict[str, Any],
+    ) -> None:
+        """Report task completion or failure to AsyncGate."""
         if execution_result.get("success"):
-            # Success receipt with artifact
-            self.emit_receipt(
-                receipt_type="success",
-                parent_receipt_ids=[accepted_receipt_id],
-                body={
+            payload = {
+                "worker_id": self.worker_id,
+                "lease_id": lease_id,
+                "result": {
                     "exit_code": execution_result.get("exit_code"),
-                    "completed_at": datetime.utcnow().isoformat()
+                    "output_path": execution_result.get("output_path"),
                 },
-                artifacts=[{
-                    "path": execution_result.get("output_path"),
+                "artifacts": {
+                    "output_path": execution_result.get("output_path"),
                     "content_type": "application/json",
-                    "description": "Command execution output"
-                }]
+                    "description": "Command execution output",
+                },
+            }
+            response = await self._client.post(
+                f"{self.asyncgate_url}/v1/tasks/{task_id}/complete",
+                headers=self.headers,
+                json=payload,
             )
         else:
-            # Failure receipt
-            self.emit_receipt(
-                receipt_type="failure",
-                parent_receipt_ids=[accepted_receipt_id],
-                body={
-                    "error": execution_result.get("error"),
-                    "failed_at": datetime.utcnow().isoformat()
-                }
+            payload = {
+                "worker_id": self.worker_id,
+                "lease_id": lease_id,
+                "error": {
+                    "message": execution_result.get("error"),
+                },
+                "retryable": False,
+            }
+            response = await self._client.post(
+                f"{self.asyncgate_url}/v1/tasks/{task_id}/fail",
+                headers=self.headers,
+                json=payload,
+            )
+
+        if response.status_code not in (200, 201):
+            self.log(
+                f"Failed to report completion: {response.status_code} - {response.text}",
+                "ERROR",
             )
     
     async def process_task(self, task: Dict[str, Any]):
         """Complete task processing workflow"""
         try:
             # Extract task data
+            task_id = task.get("task_id")
+            lease_id = task.get("lease_id")
             payload = task.get("payload", {})
             command = payload.get("command")
             output_path = payload.get("output_path")
             
+            if not task_id or not lease_id:
+                self.log("Invalid task payload - missing task_id or lease_id", "ERROR")
+                return
+
             if not command or not output_path:
                 self.log("Invalid task payload - missing command or output_path", "ERROR")
                 return
             
-            # Step 1: Accept task
-            accepted_receipt_id = self.accept_task(task)
-            if not accepted_receipt_id:
-                self.log("Failed to accept task", "ERROR")
-                return
-            
-            # Step 2: Execute command
+            # Execute command
             execution_result = self.execute_command(command, output_path)
             
-            # Step 3: Report completion
-            self.report_completion(accepted_receipt_id, execution_result)
+            # Report completion
+            await self.report_completion(task_id, lease_id, execution_result)
             
         except Exception as e:
             self.log(f"Error processing task: {e}", "ERROR")
@@ -268,25 +250,27 @@ class CommandExecutorWorker:
         """Main worker loop"""
         self.log(f"Starting worker with capabilities: {self.capabilities}")
         self.log(f"Polling AsyncGate at: {self.asyncgate_url}")
-        
-        while True:
-            try:
-                # Poll for task
-                task = await self.poll_for_task()
-                
-                if task:
-                    # Process task
-                    await self.process_task(task)
-                else:
-                    # No task available, wait before polling again
+        try:
+            while True:
+                try:
+                    # Poll for task
+                    task = await self.poll_for_task()
+
+                    if task:
+                        # Process task
+                        await self.process_task(task)
+                    else:
+                        # No task available, wait before polling again
+                        await asyncio.sleep(self.poll_interval)
+
+                except KeyboardInterrupt:
+                    self.log("Shutdown requested")
+                    break
+                except Exception as e:
+                    self.log(f"Unexpected error in main loop: {e}", "ERROR")
                     await asyncio.sleep(self.poll_interval)
-                    
-            except KeyboardInterrupt:
-                self.log("Shutdown requested")
-                break
-            except Exception as e:
-                self.log(f"Unexpected error in main loop: {e}", "ERROR")
-                await asyncio.sleep(self.poll_interval)
+        finally:
+            await self.close()
 
 
 def main():

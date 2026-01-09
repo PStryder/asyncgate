@@ -1,6 +1,7 @@
 """AsyncGate core engine - canonical operations."""
 
 import asyncio
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
@@ -46,6 +47,9 @@ from asyncgate.principals import (
     is_system,
     normalize_external,
 )
+from asyncgate.receipts import to_memorygate_receipt
+from asyncgate.observability.metrics import metrics
+from asyncgate.observability.trace import ensure_trace_id, get_trace_id
 from asyncgate.utils.time import utc_now
 
 
@@ -216,6 +220,8 @@ class AsyncGateEngine:
         payload: dict[str, Any],
         created_by: Principal,
         requirements: dict[str, Any] | None = None,
+        expected_outcome_kind: str | None = None,
+        expected_artifact_mime: str | None = None,
         priority: int | None = None,
         idempotency_key: str | None = None,
         max_attempts: int | None = None,
@@ -243,6 +249,8 @@ class AsyncGateEngine:
             payload=payload,
             created_by=created_by,
             requirements=task_requirements,
+            expected_outcome_kind=expected_outcome_kind,
+            expected_artifact_mime=expected_artifact_mime,
             priority=priority or settings.default_priority,
             idempotency_key=idempotency_key,
             max_attempts=max_attempts,
@@ -410,6 +418,39 @@ class AsyncGateEngine:
             "next_cursor": str(next_cursor) if next_cursor else None,
         }
 
+    async def list_receipts_ledger(
+        self,
+        tenant_id: UUID,
+        task_id: UUID | None = None,
+        lease_id: UUID | None = None,
+        receipt_type: ReceiptType | None = None,
+        task_status: TaskStatus | None = None,
+        since_receipt_id: UUID | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """List receipts with filters, formatted as MemoryGate receipts."""
+        limit = min(limit or settings.default_list_limit, settings.max_list_limit)
+
+        receipts, next_cursor = await self.receipts.list_filtered(
+            tenant_id=tenant_id,
+            task_id=task_id,
+            lease_id=lease_id,
+            receipt_type=receipt_type,
+            task_status=task_status,
+            since_receipt_id=since_receipt_id,
+            limit=limit,
+        )
+
+        task_ids = [r.task_id for r in receipts if r.task_id]
+        tasks_by_id = await self.tasks.get_many(tenant_id, task_ids)
+
+        return {
+            "receipts": [
+                to_memorygate_receipt(r, tasks_by_id.get(r.task_id)) for r in receipts
+            ],
+            "next_cursor": str(next_cursor) if next_cursor else None,
+        }
+
     async def ack_receipt(
         self,
         tenant_id: UUID,
@@ -505,6 +546,8 @@ class AsyncGateEngine:
                     "attempt": task.attempt,
                     "expires_at": lease.expires_at,
                     "requirements": task.requirements.model_dump() if task.requirements else None,
+                    "expected_outcome_kind": task.expected_outcome_kind,
+                    "expected_artifact_mime": task.expected_artifact_mime,
                 })
 
         return {"tasks": results}
@@ -523,7 +566,7 @@ class AsyncGateEngine:
         if not task:
             raise TaskNotFound(str(task_id))
 
-        if task.status != TaskStatus.LEASED:
+        if task.status not in {TaskStatus.LEASED, TaskStatus.RUNNING}:
             raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
 
         lease = await self.leases.renew(
@@ -553,14 +596,27 @@ class AsyncGateEngine:
         if not lease:
             raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
 
+        task = await self.tasks.get(tenant_id, task_id)
+        if not task:
+            raise TaskNotFound(str(task_id))
+
+        owner_hint = self._resolve_obligation_owner(task.created_by)
+        obligation = await self._get_task_obligation(tenant_id, task_id, owner_hint)
+        owner = obligation.to_ if obligation else owner_hint
+        parents = [obligation.receipt_id] if obligation else None
+
+        if task.status == TaskStatus.LEASED:
+            await self._transition_to_running(
+                tenant_id=tenant_id,
+                task=task,
+                worker_id=worker_id,
+                lease_id=lease_id,
+                owner=owner,
+                parents=parents,
+            )
+
         # Update progress
         await self.progress.update(tenant_id, task_id, progress_data)
-
-        task = await self.tasks.get(tenant_id, task_id)
-        owner_hint = self._resolve_obligation_owner(task.created_by) if task else None
-        obligation = await self._get_task_obligation(tenant_id, task_id, owner_hint)
-        owner = obligation.to_ if obligation else (owner_hint or self._system_owner())
-        parents = [obligation.receipt_id] if obligation else None
 
         # Emit progress receipt
         worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
@@ -576,6 +632,45 @@ class AsyncGateEngine:
         )
 
         return {"ok": True}
+
+    async def start_task(
+        self,
+        tenant_id: UUID,
+        worker_id: str,
+        task_id: UUID,
+        lease_id: UUID,
+    ) -> dict[str, Any]:
+        """Mark a task as running after the worker starts processing."""
+        lease = await self.leases.validate(tenant_id, task_id, lease_id, worker_id)
+        if not lease:
+            raise LeaseInvalidOrExpired(str(task_id), str(lease_id))
+
+        task = await self.tasks.get(tenant_id, task_id)
+        if not task:
+            raise TaskNotFound(str(task_id))
+
+        if task.status == TaskStatus.RUNNING:
+            return {
+                "ok": True,
+                "status": task.status.value,
+                "started_at": task.started_at,
+            }
+
+        owner_hint = self._resolve_obligation_owner(task.created_by)
+        obligation = await self._get_task_obligation(tenant_id, task_id, owner_hint)
+        owner = obligation.to_ if obligation else owner_hint
+        parents = [obligation.receipt_id] if obligation else None
+
+        started_at = await self._transition_to_running(
+            tenant_id=tenant_id,
+            task=task,
+            worker_id=worker_id,
+            lease_id=lease_id,
+            owner=owner,
+            parents=parents,
+        )
+
+        return {"ok": True, "status": TaskStatus.RUNNING.value, "started_at": started_at}
 
     async def complete(
         self,
@@ -842,13 +937,36 @@ class AsyncGateEngine:
                             requeued=True,
                         ),
                     )
+
+                    escalation_class = settings.escalation_lease_expiry_class
+                    if isinstance(task.payload, dict):
+                        payload_class = task.payload.get("escalation_class")
+                        if isinstance(payload_class, (int, str)):
+                            try:
+                                escalation_class = int(payload_class)
+                            except ValueError:
+                                escalation_class = settings.escalation_lease_expiry_class
+
+                    await self._emit_escalation_receipt(
+                        tenant_id=lease.tenant_id,
+                        task=task,
+                        reason=(
+                            f"Lease expired for task {task.task_id} "
+                            f"(worker {lease.worker_id})"
+                        ),
+                        escalation_class=escalation_class,
+                        obligation=obligation,
+                        lease_id=lease.lease_id,
+                    )
                 
                 count += 1
+                metrics.inc_counter("leases.expired")
             except Exception as e:
                 # Log but continue processing other leases
                 import logging
                 logger = logging.getLogger("asyncgate.engine")
                 logger.error(f"Failed to expire lease {lease.lease_id}: {e}", exc_info=True)
+                metrics.inc_counter("leases.expired.failed")
                 continue
             
             # Batch processing: commit and pause between batches
@@ -966,9 +1084,114 @@ class AsyncGateEngine:
             "version": "0.1.0",
         }
 
+    async def get_metrics_snapshot(self, tenant_id: UUID) -> dict[str, Any]:
+        """Return metrics snapshot with queue size gauges."""
+        status_counts = await self.tasks.count_by_status(tenant_id)
+        queue_sizes = {status.value: int(status_counts.get(status, 0)) for status in TaskStatus}
+
+        metrics.set_gauge("tasks.queued", queue_sizes.get(TaskStatus.QUEUED.value, 0))
+        metrics.set_gauge("tasks.leased", queue_sizes.get(TaskStatus.LEASED.value, 0))
+        metrics.set_gauge("tasks.running", queue_sizes.get(TaskStatus.RUNNING.value, 0))
+        metrics.set_gauge("tasks.succeeded", queue_sizes.get(TaskStatus.SUCCEEDED.value, 0))
+        metrics.set_gauge("tasks.failed", queue_sizes.get(TaskStatus.FAILED.value, 0))
+        metrics.set_gauge("tasks.canceled", queue_sizes.get(TaskStatus.CANCELED.value, 0))
+
+        return {
+            "metrics": metrics.snapshot(),
+            "queue_sizes": queue_sizes,
+        }
+
     # =========================================================================
     # Internal Helpers
     # =========================================================================
+
+    async def _transition_to_running(
+        self,
+        tenant_id: UUID,
+        task: Task,
+        worker_id: str,
+        lease_id: UUID,
+        owner: Principal,
+        parents: list[UUID] | None,
+    ) -> Any:
+        """Transition a leased task to running and emit task.started receipt."""
+        if task.status == TaskStatus.RUNNING:
+            return task.started_at or utc_now()
+
+        if task.status != TaskStatus.LEASED:
+            raise InvalidStateTransition(task.status.value, TaskStatus.RUNNING.value)
+
+        started_at = task.started_at or utc_now()
+        worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
+
+        async with self.session.begin_nested():  # SAVEPOINT
+            await self.tasks.update_status(
+                tenant_id,
+                task.task_id,
+                TaskStatus.RUNNING,
+                started_at=started_at,
+            )
+
+            await self._emit_receipt(
+                tenant_id=tenant_id,
+                receipt_type=ReceiptType.TASK_STARTED,
+                from_principal=worker_principal,
+                to_principal=owner,
+                task_id=task.task_id,
+                lease_id=lease_id,
+                parents=parents,
+                body=ReceiptBody.task_started(started_at=started_at),
+            )
+
+        return started_at
+
+    async def _emit_escalation_receipt(
+        self,
+        tenant_id: UUID,
+        task: Task,
+        reason: str,
+        escalation_class: int,
+        obligation: Receipt | None = None,
+        lease_id: UUID | None = None,
+    ) -> Receipt | None:
+        """Emit a task.escalated receipt when escalation targets are configured."""
+        if not settings.escalation_enabled:
+            return None
+
+        target = settings.get_escalation_target(escalation_class)
+        if not target:
+            return None
+
+        target_tenant_id = tenant_id
+        if target.tenant_id:
+            try:
+                target_tenant_id = UUID(target.tenant_id)
+            except ValueError:
+                target_tenant_id = tenant_id
+
+        to_principal = Principal(
+            kind=PrincipalKind(target.to_kind),
+            id=normalize_external(target.to_id),
+        )
+
+        parents = [obligation.receipt_id] if obligation else None
+
+        return await self._emit_receipt(
+            tenant_id=target_tenant_id,
+            receipt_type=ReceiptType.TASK_ESCALATED,
+            from_principal=self._service_principal(),
+            to_principal=to_principal,
+            task_id=task.task_id,
+            lease_id=lease_id,
+            parents=parents,
+            body=ReceiptBody.task_escalated(
+                escalation_class=str(escalation_class),
+                escalation_reason=reason,
+                escalation_to=target.to_id,
+                expected_outcome_kind=task.expected_outcome_kind,
+                expected_artifact_mime=task.expected_artifact_mime,
+            ),
+        )
 
     async def _emit_receipt(
         self,
@@ -983,7 +1206,13 @@ class AsyncGateEngine:
         parents: list[UUID] | None = None,
     ) -> Receipt:
         """Emit a receipt (either locally or to MemoryGate)."""
-        return await self.receipts.create(
+        trace_id = get_trace_id() or ensure_trace_id()
+        body_payload = dict(body) if body else {}
+        if trace_id and "trace_id" not in body_payload:
+            body_payload["trace_id"] = trace_id
+
+        start_time = perf_counter()
+        receipt = await self.receipts.create(
             tenant_id=tenant_id,
             receipt_type=receipt_type,
             from_principal=from_principal,
@@ -992,9 +1221,12 @@ class AsyncGateEngine:
             lease_id=lease_id,
             schedule_id=schedule_id,
             parents=parents,
-            body=body,
+            body=body_payload,
             receipt_hash=None,
         )
+        metrics.inc_counter("receipts.emitted.count")
+        metrics.observe("receipts.emit_latency_ms", (perf_counter() - start_time) * 1000.0)
+        return receipt
 
     async def _emit_result_ready_receipt(
         self,
@@ -1068,6 +1300,8 @@ class AsyncGateEngine:
                 "id": task.created_by.id,
             },
             "requirements": task.requirements.model_dump() if task.requirements else {},
+            "expected_outcome_kind": task.expected_outcome_kind,
+            "expected_artifact_mime": task.expected_artifact_mime,
             "priority": task.priority,
             "status": task.status.value,
             "attempt": task.attempt,
@@ -1075,6 +1309,7 @@ class AsyncGateEngine:
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "next_eligible_at": task.next_eligible_at,
+            "started_at": task.started_at,
         }
 
         if task.result:

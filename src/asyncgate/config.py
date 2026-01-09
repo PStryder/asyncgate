@@ -1,9 +1,11 @@
 """AsyncGate configuration management."""
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import Field, field_validator
+import json
+
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +22,17 @@ class ReceiptMode(str, Enum):
 
     STANDALONE = "standalone"
     MEMORYGATE_INTEGRATED = "memorygate_integrated"
+
+
+class EscalationTarget(BaseModel):
+    """Escalation target configuration."""
+
+    model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
+
+    class_id: int = Field(alias="class", description="Escalation class identifier")
+    to_kind: str = Field(default="agent", description="Target principal kind")
+    to_id: str = Field(..., description="Target principal identifier")
+    tenant_id: Optional[str] = Field(default=None, description="Override tenant ID for escalation")
 
 
 class Settings(BaseSettings):
@@ -131,6 +144,17 @@ class Settings(BaseSettings):
     receipt_retention_days: int = Field(default=30, description="Active receipt retention")
     task_retention_days: int = Field(default=7, description="Terminal task retention")
 
+    # Escalation routing
+    escalation_enabled: bool = Field(default=False, description="Enable escalation receipts")
+    escalation_targets: list[EscalationTarget] = Field(
+        default_factory=list,
+        description="Escalation targets keyed by class",
+    )
+    escalation_lease_expiry_class: int = Field(
+        default=1,
+        description="Escalation class to use for lease expiry events",
+    )
+
     # Security (v0 - simple shared token)
     api_key: Optional[str] = None
     allow_insecure_dev: bool = Field(default=False, description="Allow unauthenticated in dev")
@@ -149,7 +173,7 @@ class Settings(BaseSettings):
         description="Allowed HTTP methods"
     )
     cors_allowed_headers: list[str] = Field(
-        default=["Authorization", "Content-Type", "X-Tenant-ID"],
+        default=["Authorization", "Content-Type", "X-Tenant-ID", "X-Trace-ID", "X-Request-ID"],
         description="Allowed request headers"
     )
 
@@ -206,6 +230,22 @@ class Settings(BaseSettings):
             raise ValueError("api_key is required when allow_insecure_dev=False")
         
         return v
+
+    @field_validator("escalation_targets", mode="before")
+    @classmethod
+    def parse_escalation_targets(cls, v: Any) -> list[EscalationTarget]:
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return json.loads(v)
+        return v
+
+    def get_escalation_target(self, class_id: int) -> Optional[EscalationTarget]:
+        """Return escalation target for a class identifier."""
+        for target in self.escalation_targets:
+            if target.class_id == class_id:
+                return target
+        return None
 
 
 settings = Settings()

@@ -17,6 +17,7 @@ from asyncgate.db.tables import (
     AuditEventTable,
     RelationshipTable,
 )
+from asyncgate.auth.models import User, APIKey
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)

@@ -13,6 +13,7 @@ from asyncgate.api.deps import validate_auth_config
 from asyncgate.config import settings
 from asyncgate.db.base import close_db, init_db
 from asyncgate.instance import detect_instance_id, validate_instance_uniqueness
+from asyncgate.middleware.trace import trace_id_middleware
 from asyncgate.tasks.sweep import start_lease_sweep, stop_lease_sweep
 
 # Configure logging
@@ -69,6 +70,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Trace ID middleware (correlation across logs/receipts)
+app.middleware("http")(trace_id_middleware)
 
 # Add CORS middleware (P0.3 - explicit allowlist, no wildcards with credentials)
 app.add_middleware(

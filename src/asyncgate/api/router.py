@@ -25,11 +25,14 @@ from asyncgate.api.schemas import (
     LeaseClaimResponse,
     ListReceiptsResponse,
     ListTasksResponse,
+    MetricsResponse,
     OpenObligationsResponse,
     RenewLeaseRequest,
     RenewLeaseResponse,
     ReportProgressRequest,
     ReportProgressResponse,
+    StartTaskRequest,
+    StartTaskResponse,
     TaskResponse,
 )
 from asyncgate.api.deps import AuthContext, get_db_session, get_tenant_id, verify_api_key
@@ -45,7 +48,7 @@ from asyncgate.engine import (
 )
 from asyncgate.models import Principal, PrincipalKind
 from asyncgate.principals import is_internal_principal_id, normalize_external
-from asyncgate.models.enums import TaskStatus
+from asyncgate.models.enums import ReceiptType, TaskStatus
 
 router = APIRouter(
     prefix="/v1",
@@ -59,6 +62,14 @@ def parse_principal_kind(value: str) -> PrincipalKind:
         return PrincipalKind(value)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid principal_kind: {value}")
+
+
+def parse_receipt_type(value: str) -> ReceiptType:
+    """Parse receipt type or raise HTTP 400 on invalid value."""
+    try:
+        return ReceiptType(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid receipt_type: {value}")
 
 
 def validate_task_status(value: Optional[str]) -> Optional[str]:
@@ -106,6 +117,17 @@ async def get_config(
     engine = AsyncGateEngine(session)
     config = await engine.get_config()
     return ConfigResponse(**config)
+
+
+@router.get("/metrics", response_model=MetricsResponse)
+async def get_metrics(
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: UUID = Depends(get_tenant_id),
+):
+    """Get metrics snapshot with queue sizes."""
+    engine = AsyncGateEngine(session)
+    result = await engine.get_metrics_snapshot(tenant_id=tenant_id)
+    return MetricsResponse(**result)
 
 
 # ============================================================================
@@ -282,6 +304,8 @@ async def create_task(
             payload=request.payload,
             created_by=created_by,
             requirements=request.requirements,
+            expected_outcome_kind=request.expected_outcome_kind,
+            expected_artifact_mime=request.expected_artifact_mime,
             priority=request.priority,
             idempotency_key=request.idempotency_key,
             max_attempts=request.max_attempts,
@@ -293,6 +317,35 @@ async def create_task(
         raise HTTPException(status_code=403, detail=e.message)
 
     return CreateTaskResponse(**result)
+
+
+@router.get("/tasks/running", response_model=ListTasksResponse)
+async def list_running_tasks(
+    type: Optional[str] = Query(None),
+    created_by: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    cursor: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
+):
+    """List tasks currently in running state."""
+    engine = AsyncGateEngine(session)
+
+    if created_by:
+        created_by = normalize_external(created_by)
+        ensure_internal_principal_allowed(created_by, auth)
+
+    result = await engine.list_tasks(
+        tenant_id=tenant_id,
+        status=TaskStatus.RUNNING.value,
+        type=type,
+        created_by_id=created_by,
+        limit=limit,
+        cursor=cursor,
+    )
+
+    return ListTasksResponse(**result)
 
 
 @router.get("/tasks/{task_id}")
@@ -338,6 +391,8 @@ async def list_tasks(
     )
 
     return ListTasksResponse(**result)
+
+
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=CancelTaskResponse)
@@ -398,6 +453,43 @@ async def list_receipts(
         tenant_id=tenant_id,
         to_kind=to_kind,
         to_id=to_id,
+        since_receipt_id=since_receipt_id,
+        limit=limit,
+    )
+
+    return ListReceiptsResponse(**result)
+
+
+@router.get("/receipts/ledger", response_model=ListReceiptsResponse)
+async def list_receipts_ledger(
+    task_id: Optional[UUID] = Query(None),
+    lease_id: Optional[UUID] = Query(None),
+    status: Optional[str] = Query(None),
+    receipt_type: Optional[str] = Query(None),
+    since_receipt_id: Optional[UUID] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: UUID = Depends(get_tenant_id),
+):
+    """List receipts by task/lease/status in MemoryGate schema."""
+    if not any([task_id, lease_id, status, receipt_type]):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one filter: task_id, lease_id, status, or receipt_type",
+        )
+
+    engine = AsyncGateEngine(session)
+
+    status_value = validate_task_status(status)
+    task_status = TaskStatus(status_value) if status_value else None
+    receipt_type_value = parse_receipt_type(receipt_type) if receipt_type else None
+
+    result = await engine.list_receipts_ledger(
+        tenant_id=tenant_id,
+        task_id=task_id,
+        lease_id=lease_id,
+        receipt_type=receipt_type_value,
+        task_status=task_status,
         since_receipt_id=since_receipt_id,
         limit=limit,
     )
@@ -504,6 +596,30 @@ async def report_progress(
         )
         return ReportProgressResponse(**result)
     except LeaseInvalidOrExpired as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
+
+@router.post("/tasks/{task_id}/running", response_model=StartTaskResponse)
+async def start_task(
+    task_id: UUID,
+    request: StartTaskRequest,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: UUID = Depends(get_tenant_id),
+):
+    """Mark task as running."""
+    engine = AsyncGateEngine(session)
+
+    try:
+        result = await engine.start_task(
+            tenant_id=tenant_id,
+            worker_id=request.worker_id,
+            task_id=task_id,
+            lease_id=request.lease_id,
+        )
+        return StartTaskResponse(**result)
+    except TaskNotFound as e:
+        raise HTTPException(status_code=404, detail=e.message)
+    except (LeaseInvalidOrExpired, InvalidStateTransition) as e:
         raise HTTPException(status_code=400, detail=e.message)
 
 

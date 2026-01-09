@@ -118,6 +118,15 @@ class ReceiptBody:
         }
 
     @staticmethod
+    def task_started(
+        started_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Body for task.started receipt."""
+        return {
+            "started_at": started_at.isoformat() if started_at else None,
+        }
+
+    @staticmethod
     def task_completed(
         result_summary: str,
         result_payload: dict | None = None,
@@ -203,6 +212,23 @@ class ReceiptBody:
             "previous_worker_id": previous_worker_id,
             "attempt": attempt,
             "requeued": requeued,
+        }
+
+    @staticmethod
+    def task_escalated(
+        escalation_class: str,
+        escalation_reason: str,
+        escalation_to: str,
+        expected_outcome_kind: str | None = None,
+        expected_artifact_mime: str | None = None,
+    ) -> dict[str, Any]:
+        """Body for task.escalated receipt."""
+        return {
+            "escalation_class": escalation_class,
+            "escalation_reason": escalation_reason,
+            "escalation_to": escalation_to,
+            "expected_outcome_kind": expected_outcome_kind,
+            "expected_artifact_mime": expected_artifact_mime,
         }
 
     @staticmethod

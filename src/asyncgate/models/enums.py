@@ -8,6 +8,7 @@ class TaskStatus(str, Enum):
 
     QUEUED = "queued"
     LEASED = "leased"
+    RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELED = "canceled"
@@ -47,6 +48,7 @@ class ReceiptType(str, Enum):
     TASK_ASSIGNED = "task.assigned"
     # Task accepted by worker (Worker → AsyncGate)
     TASK_ACCEPTED = "task.accepted"
+    TASK_STARTED = "task.started"
     # Task completed (Worker → AsyncGate)
     TASK_COMPLETED = "task.completed"
     # Task failed (Worker → AsyncGate)
@@ -61,6 +63,7 @@ class ReceiptType(str, Enum):
     TASK_PROGRESS = "task.progress"
     # Lease expired / requeued (AsyncGate → Agent)
     LEASE_EXPIRED = "lease.expired"
+    TASK_ESCALATED = "task.escalated"
     # Receipt acknowledged (TASKER → AsyncGate)
     RECEIPT_ACKNOWLEDGED = "receipt.acknowledged"
     # System anomaly (AsyncGate → Agent)

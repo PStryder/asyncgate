@@ -1,16 +1,19 @@
 # AsyncGate Database Migrations
 
-Manual SQL migrations for AsyncGate schema changes.
+Manual SQL migrations for legacy schema changes.
+
+AsyncGate now supports Alembic migrations for schema evolution.
 
 ## Running Migrations
 
 Migrations should be run in order. Each migration is idempotent (safe to run multiple times).
 
 ```bash
-# Run a specific migration
-psql $DATABASE_URL -f migrations/001_add_parents_gin_index.sql
+# Preferred (Alembic)
+alembic upgrade head
 
-# Or use your preferred database client
+# Legacy SQL (manual, only if needed)
+psql $DATABASE_URL -f migrations/001_add_parents_gin_index.sql
 ```
 
 ## Migration List
@@ -61,11 +64,8 @@ WHERE parents @> '["some-uuid"]'::jsonb;
 -- Should show: "Index Scan using idx_receipts_parents_gin"
 ```
 
-## Future: Alembic Integration
+## Alembic Notes
 
-Eventually, these migrations should be managed via Alembic for:
-- Automatic version tracking
-- Rollback capability
-- Multi-instance coordination
-
-For now, manual SQL ensures immediate deployment without migration framework setup.
+Alembic migrations live under `alembic/versions/` and are the
+authoritative schema history going forward. Manual SQL files are
+kept for backward compatibility with early deployments.

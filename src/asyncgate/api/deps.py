@@ -2,8 +2,7 @@
 
 import logging
 import secrets
-from dataclasses import dataclass
-from typing import AsyncGenerator, Literal, Optional, TYPE_CHECKING
+from typing import AsyncGenerator, Optional, TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException
@@ -11,21 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.config import Environment, settings
 from asyncgate.db.base import async_session_factory
+from asyncgate.auth.context import AuthContext
 
 if TYPE_CHECKING:
     from asyncgate.auth.models import User
 
 
 logger = logging.getLogger("asyncgate.api")
-
-
-@dataclass(frozen=True)
-class AuthContext:
-    """Authentication context for the current request."""
-
-    user: "User | None"
-    auth_type: Literal["db_api_key", "legacy_api_key", "insecure_dev"]
-    is_internal: bool
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:

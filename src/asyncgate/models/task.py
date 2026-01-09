@@ -62,9 +62,14 @@ class Task(BaseModel):
     created_at: datetime
     updated_at: datetime
     next_eligible_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
 
     # Result (populated when terminal)
     result: Optional[TaskResult] = None
+
+    # Expected outcome metadata (for receipt shaping)
+    expected_outcome_kind: Optional[str] = None
+    expected_artifact_mime: Optional[str] = None
 
     # AsyncGate instance ownership (for multi-instance deployments)
     asyncgate_instance: Optional[str] = None
@@ -78,6 +83,13 @@ class Task(BaseModel):
         valid_transitions: dict[TaskStatus, set[TaskStatus]] = {
             TaskStatus.QUEUED: {TaskStatus.LEASED, TaskStatus.CANCELED},
             TaskStatus.LEASED: {
+                TaskStatus.RUNNING,
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELED,
+                TaskStatus.QUEUED,  # On lease expiry (system-driven)
+            },
+            TaskStatus.RUNNING: {
                 TaskStatus.SUCCEEDED,
                 TaskStatus.FAILED,
                 TaskStatus.CANCELED,

@@ -61,6 +61,8 @@ class TaskRepository:
         payload: dict[str, Any],
         created_by: Principal,
         requirements: TaskRequirements | None = None,
+        expected_outcome_kind: str | None = None,
+        expected_artifact_mime: str | None = None,
         priority: int = 0,
         idempotency_key: str | None = None,
         max_attempts: int | None = None,
@@ -88,6 +90,8 @@ class TaskRepository:
             created_by_id=created_by.id,
             created_by_instance_id=created_by.instance_id,
             requirements=requirements.model_dump() if requirements else {},
+            expected_outcome_kind=expected_outcome_kind,
+            expected_artifact_mime=expected_artifact_mime,
             priority=priority,
             status=TaskStatus.QUEUED,
             attempt=0,
@@ -97,6 +101,7 @@ class TaskRepository:
             created_at=now,
             updated_at=now,
             next_eligible_at=next_eligible_at,
+            started_at=None,
             asyncgate_instance=settings.instance_id,
         )
 
@@ -125,6 +130,20 @@ class TaskRepository:
         )
         row = result.scalar_one_or_none()
         return self._row_to_model(row) if row else None
+
+    async def get_many(self, tenant_id: UUID, task_ids: list[UUID]) -> dict[UUID, Task]:
+        """Get multiple tasks by ID in a single query."""
+        if not task_ids:
+            return {}
+
+        result = await self.session.execute(
+            select(TaskTable).where(
+                TaskTable.tenant_id == tenant_id,
+                TaskTable.task_id.in_(task_ids),
+            )
+        )
+        rows = result.scalars().all()
+        return {row.task_id: self._row_to_model(row) for row in rows}
 
     async def list(
         self,
@@ -169,6 +188,7 @@ class TaskRepository:
         task_id: UUID,
         new_status: TaskStatus,
         result: TaskResult | None = None,
+        started_at: datetime | None = None,
     ) -> Task | None:
         """Update task status."""
         now = utc_now()
@@ -184,6 +204,9 @@ class TaskRepository:
             values["result_error"] = result.error
             values["result_artifacts"] = result.artifacts
             values["completed_at"] = result.completed_at
+
+        if started_at is not None:
+            values["started_at"] = started_at
 
         await self.session.execute(
             update(TaskTable)
@@ -233,6 +256,7 @@ class TaskRepository:
             "attempt": attempt,
             "next_eligible_at": next_eligible_at,
             "updated_at": now,
+            "started_at": None,
         }
 
         await self.session.execute(
@@ -281,6 +305,7 @@ class TaskRepository:
             "attempt": attempt,
             "next_eligible_at": next_eligible_at,
             "updated_at": now,
+            "started_at": None,
         }
 
         await self.session.execute(
@@ -334,7 +359,10 @@ class TaskRepository:
             created_at=row.created_at,
             updated_at=row.updated_at,
             next_eligible_at=row.next_eligible_at,
+            started_at=row.started_at,
             result=result,
+            expected_outcome_kind=row.expected_outcome_kind,
+            expected_artifact_mime=row.expected_artifact_mime,
             asyncgate_instance=row.asyncgate_instance,
         )
 
@@ -582,7 +610,10 @@ class LeaseRepository:
                     LeaseTable.task_id == TaskTable.task_id,
                 ),
             )
-            .where(LeaseTable.expires_at < now)
+            .where(
+                LeaseTable.expires_at < now,
+                TaskTable.status.in_([TaskStatus.LEASED, TaskStatus.RUNNING]),
+            )
         )
         
         # Filter by instance if provided (for multi-instance safety)
@@ -756,6 +787,25 @@ class ReceiptRepository:
         
         # Emit anomaly receipt if locatability was missing
         if emit_locatability_anomaly:
+            trace_id = None
+            if isinstance(body, dict):
+                trace_id = body.get("trace_id")
+            if not trace_id:
+                from asyncgate.observability.trace import get_trace_id
+                trace_id = get_trace_id()
+
+            anomaly_body = {
+                "anomaly_type": "locatability_missing",
+                "message": (
+                    f"Success receipt {receipt_id} lacks locatability (no artifacts or delivery_proof). "
+                    "Obligation remains open until properly locatable success is provided."
+                ),
+                "original_receipt_id": str(receipt_id),
+                "stripped_parents": [str(p) for p in (parents or [])],
+            }
+            if trace_id:
+                anomaly_body["trace_id"] = trace_id
+
             anomaly_receipt = ReceiptTable(
                 tenant_id=tenant_id,
                 receipt_id=uuid4(),
@@ -769,15 +819,7 @@ class ReceiptRepository:
                 lease_id=None,
                 schedule_id=None,
                 parents=[str(receipt_id)],  # References the stripped-parent receipt
-                body={
-                    "anomaly_type": "locatability_missing",
-                    "message": (
-                        f"Success receipt {receipt_id} lacks locatability (no artifacts or delivery_proof). "
-                        "Obligation remains open until properly locatable success is provided."
-                    ),
-                    "original_receipt_id": str(receipt_id),
-                    "stripped_parents": [str(p) for p in (parents or [])],
-                },
+                body=anomaly_body,
                 hash=None,
                 asyncgate_instance=settings.instance_id,
             )
@@ -804,6 +846,66 @@ class ReceiptRepository:
 
         if since_receipt_id:
             # Get created_at of cursor receipt
+            cursor_result = await self.session.execute(
+                select(ReceiptTable.created_at).where(
+                    ReceiptTable.tenant_id == tenant_id,
+                    ReceiptTable.receipt_id == since_receipt_id,
+                )
+            )
+            cursor_time = cursor_result.scalar_one_or_none()
+            if cursor_time:
+                query = query.where(ReceiptTable.created_at > cursor_time)
+
+        query = query.order_by(ReceiptTable.created_at.asc()).limit(limit + 1)
+
+        result = await self.session.execute(query)
+        rows = list(result.scalars().all())
+
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            next_cursor = rows[-1].receipt_id
+
+        return [self._row_to_model(r) for r in rows], next_cursor
+
+    async def count_by_status(self, tenant_id: UUID) -> dict[TaskStatus, int]:
+        """Count tasks by status for a tenant."""
+        result = await self.session.execute(
+            select(TaskTable.status, func.count())
+            .where(TaskTable.tenant_id == tenant_id)
+            .group_by(TaskTable.status)
+        )
+        return {row[0]: row[1] for row in result.all()}
+
+    async def list_filtered(
+        self,
+        tenant_id: UUID,
+        task_id: UUID | None = None,
+        lease_id: UUID | None = None,
+        receipt_type: ReceiptType | None = None,
+        task_status: TaskStatus | None = None,
+        since_receipt_id: UUID | None = None,
+        limit: int = 50,
+    ) -> tuple[list[Receipt], UUID | None]:
+        """List receipts with optional task/lease/status filters."""
+        query = select(ReceiptTable).where(ReceiptTable.tenant_id == tenant_id)
+
+        if task_id:
+            query = query.where(ReceiptTable.task_id == task_id)
+        if lease_id:
+            query = query.where(ReceiptTable.lease_id == lease_id)
+        if receipt_type:
+            query = query.where(ReceiptTable.receipt_type == receipt_type)
+        if task_status:
+            query = query.join(
+                TaskTable,
+                and_(
+                    ReceiptTable.tenant_id == TaskTable.tenant_id,
+                    ReceiptTable.task_id == TaskTable.task_id,
+                ),
+            ).where(TaskTable.status == task_status)
+
+        if since_receipt_id:
             cursor_result = await self.session.execute(
                 select(ReceiptTable.created_at).where(
                     ReceiptTable.tenant_id == tenant_id,

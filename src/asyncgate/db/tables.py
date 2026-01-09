@@ -44,6 +44,10 @@ class TaskTable(Base):
     # Requirements
     requirements: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default={})
 
+    # Expected outcome metadata
+    expected_outcome_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    expected_artifact_mime: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     # Priority
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
@@ -64,6 +68,7 @@ class TaskTable(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     next_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Result (for terminal tasks)
     result_outcome: Mapped[str | None] = mapped_column(String(50), nullable=True)
@@ -99,6 +104,8 @@ class TaskTable(Base):
         ),
         # Index for listing by status
         Index("idx_tasks_tenant_status", "tenant_id", "status", "created_at"),
+        # Index for listing running tasks
+        Index("idx_tasks_running", "tenant_id", "status", "started_at"),
         # Index for instance ownership
         Index("idx_tasks_instance", "asyncgate_instance"),
     )
@@ -194,6 +201,10 @@ class ReceiptTable(Base):
         Index("idx_receipts_to", "tenant_id", "to_kind", "to_id", "created_at"),
         # Index for task receipts
         Index("idx_receipts_task", "tenant_id", "task_id", "created_at"),
+        # Index for lease receipts
+        Index("idx_receipts_lease", "tenant_id", "lease_id", "created_at"),
+        # Index for receipt type queries
+        Index("idx_receipts_type", "tenant_id", "receipt_type", "created_at"),
         # Index for deduplication (redundant with unique constraint, but kept for explicit queries)
         Index("idx_receipts_hash", "tenant_id", "hash"),
         # GIN index for parents array containment queries (P0.1 - performance critical)

@@ -218,6 +218,23 @@ class CommandExecutorWorker:
                 f"Failed to report completion: {response.status_code} - {response.text}",
                 "ERROR",
             )
+
+    async def report_running(self, task_id: str, lease_id: str) -> None:
+        """Report task start to AsyncGate."""
+        payload = {
+            "worker_id": self.worker_id,
+            "lease_id": lease_id,
+        }
+        response = await self._client.post(
+            f"{self.asyncgate_url}/v1/tasks/{task_id}/running",
+            headers=self.headers,
+            json=payload,
+        )
+        if response.status_code not in (200, 201):
+            self.log(
+                f"Failed to report running: {response.status_code} - {response.text}",
+                "WARN",
+            )
     
     async def process_task(self, task: Dict[str, Any]):
         """Complete task processing workflow"""
@@ -236,6 +253,8 @@ class CommandExecutorWorker:
             if not command or not output_path:
                 self.log("Invalid task payload - missing command or output_path", "ERROR")
                 return
+
+            await self.report_running(task_id, lease_id)
             
             # Execute command
             execution_result = self.execute_command(command, output_path)

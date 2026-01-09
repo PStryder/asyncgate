@@ -50,6 +50,8 @@ class CreateTaskRequest(BaseModel):
     type: str = Field(..., description="Task type")
     payload: dict[str, Any] = Field(default_factory=dict, description="Task payload")
     requirements: Optional[dict[str, Any]] = Field(None, description="Task requirements")
+    expected_outcome_kind: Optional[str] = Field(None, description="Expected outcome kind")
+    expected_artifact_mime: Optional[str] = Field(None, description="Expected artifact MIME type")
     priority: Optional[int] = Field(None, description="Task priority (higher = more urgent)")
     idempotency_key: Optional[str] = Field(None, description="Idempotency key")
     max_attempts: Optional[int] = Field(None, ge=1, description="Max retry attempts")
@@ -72,6 +74,8 @@ class TaskResponse(BaseModel):
     payload: dict[str, Any]
     created_by: dict[str, Any]
     requirements: dict[str, Any]
+    expected_outcome_kind: Optional[str] = None
+    expected_artifact_mime: Optional[str] = None
     priority: int
     status: str
     attempt: int
@@ -79,6 +83,7 @@ class TaskResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     next_eligible_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
     result: Optional[dict[str, Any]] = None
     progress: Optional[dict[str, Any]] = None
 
@@ -152,6 +157,8 @@ class LeaseInfoSchema(BaseModel):
     attempt: int
     expires_at: datetime
     requirements: Optional[dict[str, Any]] = None
+    expected_outcome_kind: Optional[str] = None
+    expected_artifact_mime: Optional[str] = None
 
 
 class LeaseClaimResponse(BaseModel):
@@ -190,6 +197,22 @@ class ReportProgressResponse(BaseModel):
     """Report progress response."""
 
     ok: bool
+
+
+class StartTaskRequest(BaseModel):
+    """Mark task as running request."""
+
+    worker_kind: str = Field(default="worker")
+    worker_id: str
+    lease_id: UUID
+
+
+class StartTaskResponse(BaseModel):
+    """Mark task as running response."""
+
+    ok: bool
+    status: str
+    started_at: Optional[datetime] = None
 
 
 class CompleteTaskRequest(BaseModel):
@@ -248,3 +271,10 @@ class ConfigResponse(BaseModel):
     instance_id: str
     capabilities: list[str]
     version: str
+
+
+class MetricsResponse(BaseModel):
+    """Metrics snapshot response."""
+
+    metrics: dict[str, Any]
+    queue_sizes: dict[str, int]

@@ -1,0 +1,16 @@
+.git/
+.github/
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.local
+*.log
+receipts/
+test_*.sh
+docker-compose*.yml
+fly.toml
+k8s/
+*.md
+!README.md

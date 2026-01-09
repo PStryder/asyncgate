@@ -3,11 +3,10 @@ version: '3.8'
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: asyncgate-postgres
     environment:
-      POSTGRES_USER: asyncgate
-      POSTGRES_PASSWORD: asyncgate
       POSTGRES_DB: asyncgate
+      POSTGRES_USER: asyncgate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-asyncgate_dev}
     ports:
       - "5432:5432"
     volumes:
@@ -17,24 +16,36 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'
 
   asyncgate:
     build: .
-    container_name: asyncgate
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    environment:
+      - ASYNCGATE_ENV=development
+      - ASYNCGATE_DATABASE_URL=postgresql+asyncpg://asyncgate:${POSTGRES_PASSWORD:-asyncgate_dev}@postgres:5432/asyncgate
+      - ASYNCGATE_API_KEY=${ASYNCGATE_API_KEY:-dev_key_insecure}
+      - ASYNCGATE_LOG_LEVEL=INFO
+      - ASYNCGATE_RATE_LIMIT_ENABLED=true
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      ASYNCGATE_ENV: development
-      ASYNCGATE_DATABASE_URL: postgresql+asyncpg://asyncgate:asyncgate@postgres:5432/asyncgate
-      ASYNCGATE_API_KEY: dev-test-key-not-for-production
-      ASYNCGATE_ALLOW_INSECURE_DEV: "true"
-      ASYNCGATE_LOG_LEVEL: DEBUG
-      ASYNCGATE_CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:8080
-      ASYNCGATE_RATE_LIMIT_ENABLED: "true"
-      ASYNCGATE_RATE_LIMIT_BACKEND: memory
-    ports:
-      - "8000:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/v1/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
     command: >
       sh -c "
         echo 'Waiting for database...' &&
@@ -42,7 +53,7 @@ services:
         echo 'Running migrations...' &&
         alembic upgrade head &&
         echo 'Starting AsyncGate...' &&
-        uvicorn asyncgate.main:app --host 0.0.0.0 --port 8080 --reload
+        uvicorn asyncgate.main:app --host 0.0.0.0 --port 8080
       "
 
 volumes:

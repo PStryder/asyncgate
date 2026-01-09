@@ -58,23 +58,34 @@ docker run -p 8080:8080 \
   asyncgate
 ```
 
-### Fly.io Deployment
+## Deployment
 
+AsyncGate supports three deployment methods:
+
+### Fly.io (Recommended for Production)
 ```bash
-# Create app (do not deploy yet)
-fly apps create asyncgate
+./deploy-fly.sh
+```
 
-# Create Postgres database
-fly postgres create --name asyncgate-db
+See [Fly Operations Guide](docs/FLY_OPERATIONS.md) for details.
 
-# Attach database
-fly postgres attach asyncgate-db --app asyncgate
-
-# Set secrets
-fly secrets set ASYNCGATE_API_KEY="your-secret-key"
+### Kubernetes
+```bash
+# Create secrets
+kubectl create secret generic asyncgate-secrets \
+  --from-literal=ASYNCGATE_API_KEY=your-key \
+  --from-literal=ASYNCGATE_DATABASE_URL=postgresql://... \
+  -n asyncgate
 
 # Deploy
-fly deploy
+kubectl apply -k k8s/overlays/prod
+```
+
+See [k8s/README.md](k8s/README.md) for details.
+
+### Docker Compose (Development)
+```bash
+docker-compose up --build
 ```
 
 ## API
@@ -157,17 +168,18 @@ Environment variables (prefix `ASYNCGATE_`):
 
 ## Task Lifecycle
 
-States: `queued`, `leased`, `succeeded`, `failed`, `canceled`
+States: `queued`, `running`, `leased`, `succeeded`, `failed`, `canceled`
 
 ```
-queued -> leased -> succeeded
-                 \-> failed -> queued (retry)
-                  \-> canceled
+queued -> running -> leased -> succeeded
+                            \-> failed -> queued (retry)
+                             \-> canceled
 ```
 
 ### State Transitions
 
-- `queued -> leased`: Worker claims task
+- `queued -> running`: Worker picks up task
+- `running -> leased`: Task claimed with lease
 - `leased -> succeeded`: Task completes successfully
 - `leased -> failed`: Task fails (may retry)
 - `queued/leased -> canceled`: Task canceled

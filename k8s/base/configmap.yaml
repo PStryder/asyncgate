@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: asyncgate-config
+  namespace: asyncgate
+data:
+  ASYNCGATE_ENV: "production"
+  ASYNCGATE_LOG_LEVEL: "INFO"
+  ASYNCGATE_HOST: "0.0.0.0"
+  ASYNCGATE_PORT: "8080"
+  ASYNCGATE_RATE_LIMIT_ENABLED: "true"
+  ASYNCGATE_RATE_LIMIT_REQUESTS_PER_MINUTE: "100"

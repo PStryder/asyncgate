@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: asyncgate
+  namespace: asyncgate
+  labels:
+    app: asyncgate
+spec:
+  type: ClusterIP
+  selector:
+    app: asyncgate
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  - name: metrics
+    port: 9091
+    targetPort: 9091
+    protocol: TCP

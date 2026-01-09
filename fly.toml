@@ -1,23 +1,31 @@
-# fly.toml - Fly.io configuration for AsyncGate
-# See https://fly.io/docs/reference/configuration/
-
 app = "asyncgate"
 primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[experimental]
+  auto_rollback = true
 
 [build]
+
+[deploy]
+  release_command = "alembic upgrade head"
+  strategy = "rolling"
 
 [env]
   ASYNCGATE_ENV = "production"
   ASYNCGATE_LOG_LEVEL = "INFO"
-  # Database URL should be set via secrets: fly secrets set DATABASE_URL=...
-  # Redis URL should be set via secrets: fly secrets set REDIS_URL=...
+  ASYNCGATE_HOST = "0.0.0.0"
+  ASYNCGATE_PORT = "8080"
+  ASYNCGATE_RATE_LIMIT_ENABLED = "true"
+  ASYNCGATE_RATE_LIMIT_REQUESTS_PER_MINUTE = "100"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 1
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 2
   processes = ["app"]
 
   [http_service.concurrency]
@@ -35,11 +43,36 @@ primary_region = "iad"
     grace_period = "10s"
     interval = "30s"
     method = "GET"
-    path = "/health"
+    path = "/v1/health"
     port = 8080
     timeout = "5s"
     type = "http"
+    [checks.health.headers]
+      X-Forwarded-Proto = "https"
 
 [metrics]
   port = 9091
   path = "/metrics"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+  
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"

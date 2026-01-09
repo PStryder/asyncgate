@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.db.repositories import ReceiptRepository
 from asyncgate.models import Principal, PrincipalKind, ReceiptType
+from asyncgate.principals import SYSTEM_PRINCIPAL_ID
 
 
 @pytest.mark.asyncio
@@ -32,7 +33,7 @@ async def test_list_open_obligations_performance(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     # Create 100 obligation receipts
     obligation_ids = []
@@ -58,7 +59,10 @@ async def test_list_open_obligations_performance(session: AsyncSession):
             to_principal=agent,
             task_id=uuid4(),  # Different task
             parents=[obligation_ids[i]],  # References obligation as parent
-            body={"result": f"completed_{i}"},
+            body={
+                "result": f"completed_{i}",
+                "artifacts": [{"type": "test", "uri": f"mem://completed/{i}"}],
+            },
         )
     
     await session.commit()
@@ -70,7 +74,7 @@ async def test_list_open_obligations_performance(session: AsyncSession):
     open_oblig, cursor = await receipts.list_open_obligations(
         tenant_id=tenant_id,
         to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_id=SYSTEM_PRINCIPAL_ID,
         limit=100,
     )
     
@@ -99,7 +103,7 @@ async def test_list_open_obligations_hard_cap(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     # Create 1500 obligation receipts (exceeds hard cap)
     for i in range(1500):
@@ -122,7 +126,7 @@ async def test_list_open_obligations_hard_cap(session: AsyncSession):
     open_oblig, cursor = await receipts.list_open_obligations(
         tenant_id=tenant_id,
         to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_id=SYSTEM_PRINCIPAL_ID,
         limit=500,  # Requests 500, but candidate_limit caps at 1000
     )
     
@@ -141,7 +145,7 @@ async def test_list_open_obligations_pagination(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     # Create 30 obligations
     for i in range(30):
@@ -160,7 +164,7 @@ async def test_list_open_obligations_pagination(session: AsyncSession):
     page1, cursor1 = await receipts.list_open_obligations(
         tenant_id=tenant_id,
         to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_id=SYSTEM_PRINCIPAL_ID,
         limit=10,
     )
     
@@ -171,7 +175,7 @@ async def test_list_open_obligations_pagination(session: AsyncSession):
     page2, cursor2 = await receipts.list_open_obligations(
         tenant_id=tenant_id,
         to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_id=SYSTEM_PRINCIPAL_ID,
         since_receipt_id=cursor1,
         limit=10,
     )

@@ -1,9 +1,11 @@
 """Lease model - worker claim on a task."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel
+
+from asyncgate.utils.time import utc_now
 
 
 class Lease(BaseModel):
@@ -21,7 +23,7 @@ class Lease(BaseModel):
     def is_expired(self, now: datetime | None = None) -> bool:
         """Check if lease has expired."""
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = utc_now()
         return now >= self.expires_at
 
 

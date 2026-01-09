@@ -1,9 +1,6 @@
 """AsyncGate core engine - canonical operations."""
 
 import asyncio
-import hashlib
-import json
-from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -41,7 +38,15 @@ from asyncgate.models import (
 )
 from asyncgate.models.enums import AnomalyKind, Outcome
 from asyncgate.models.lease import LeaseInfo
-from asyncgate.models.receipt import ReceiptBody
+from asyncgate.models.receipt import ReceiptBody, compute_receipt_hash
+from asyncgate.principals import (
+    SERVICE_PRINCIPAL_ID,
+    SYSTEM_PRINCIPAL_ID,
+    is_internal_principal_id,
+    is_system,
+    normalize_external,
+)
+from asyncgate.utils.time import utc_now
 
 
 class AsyncGateEngine:
@@ -54,6 +59,69 @@ class AsyncGateEngine:
         self.receipts = ReceiptRepository(session)
         self.progress = ProgressRepository(session)
         self.relationships = RelationshipRepository(session)
+
+    def _service_principal(self) -> Principal:
+        """Return the canonical service principal for AsyncGate-emitted receipts."""
+        return Principal(kind=PrincipalKind.SERVICE, id=SERVICE_PRINCIPAL_ID)
+
+    def _system_owner(self) -> Principal:
+        """Return the canonical system owner principal."""
+        return Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
+
+    def _normalize_principal(self, principal: Principal) -> Principal:
+        """Normalize external principal IDs without rewriting ownership."""
+        return Principal(
+            kind=principal.kind,
+            id=normalize_external(principal.id),
+            instance_id=principal.instance_id,
+        )
+
+    def _resolve_obligation_owner(self, created_by: Principal) -> Principal:
+        """Resolve obligation owner from the creator principal."""
+        normalized = self._normalize_principal(created_by)
+        if is_system(normalized.id) or normalized.id == SERVICE_PRINCIPAL_ID:
+            return self._system_owner()
+        return normalized
+
+    async def _get_task_obligation(
+        self,
+        tenant_id: UUID,
+        task_id: UUID,
+        owner_hint: Principal | None = None,
+    ) -> Receipt | None:
+        """Fetch the task.assigned receipt for a task, if present."""
+        obligation = await self.receipts.get_task_obligation(
+            tenant_id=tenant_id,
+            task_id=task_id,
+            owner=owner_hint,
+        )
+        if not obligation and owner_hint:
+            obligation = await self.receipts.get_task_obligation(
+                tenant_id=tenant_id,
+                task_id=task_id,
+                owner=None,
+            )
+        return obligation
+
+    async def _get_task_owner(self, tenant_id: UUID, task: Task) -> Principal:
+        """Resolve task owner via obligation receipt, falling back to creator."""
+        owner_hint = self._resolve_obligation_owner(task.created_by)
+        obligation = await self._get_task_obligation(tenant_id, task.task_id, owner_hint)
+        if obligation:
+            return obligation.to_
+        return owner_hint
+
+    async def _get_task_obligation_or_raise(
+        self,
+        tenant_id: UUID,
+        task_id: UUID,
+        owner_hint: Principal | None = None,
+    ) -> Receipt:
+        """Fetch task obligation receipt or raise if missing."""
+        obligation = await self._get_task_obligation(tenant_id, task_id, owner_hint)
+        if not obligation:
+            raise ValueError(f"Missing task.assigned receipt for task {task_id}")
+        return obligation
 
     # =========================================================================
     # TASKER Operations (post/observe/control)
@@ -75,6 +143,7 @@ class AsyncGateEngine:
         
         Bootstrap is idempotent and safe to call frequently.
         """
+        principal = self._normalize_principal(principal)
         max_items = min(
             max_items or settings.default_bootstrap_max_items,
             settings.max_bootstrap_max_items,
@@ -152,12 +221,18 @@ class AsyncGateEngine:
         max_attempts: int | None = None,
         retry_backoff_seconds: int | None = None,
         delay_seconds: int | None = None,
+        actor_is_internal: bool = False,
     ) -> dict[str, Any]:
         """
         Create a new task.
 
         If idempotency_key is provided and matches existing task, returns that task.
         """
+        created_by = self._normalize_principal(created_by)
+        if is_internal_principal_id(created_by.id) and not actor_is_internal:
+            raise UnauthorizedError(
+                "Internal principal IDs require authenticated internal access"
+            )
         task_requirements = None
         if requirements:
             task_requirements = TaskRequirements(**requirements)
@@ -175,13 +250,15 @@ class AsyncGateEngine:
             delay_seconds=delay_seconds,
         )
 
+        owner = self._resolve_obligation_owner(created_by)
+        service_principal = self._service_principal()
+
         # Emit task.assigned receipt
-        asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
         await self._emit_receipt(
             tenant_id=tenant_id,
             receipt_type=ReceiptType.TASK_ASSIGNED,
-            from_principal=created_by,
-            to_principal=asyncgate_principal,
+            from_principal=service_principal,
+            to_principal=owner,
             task_id=task.task_id,
             body=ReceiptBody.task_assigned(
                 instructions=f"Execute task type: {type}",
@@ -243,23 +320,38 @@ class AsyncGateEngine:
         task_id: UUID,
         principal: Principal,
         reason: str | None = None,
+        actor_is_internal: bool = False,
     ) -> dict[str, Any]:
         """
         Cancel a task.
         
         P0.2: All state changes + receipt emissions are atomic via savepoint.
         """
+        principal = self._normalize_principal(principal)
         task = await self.tasks.get(tenant_id, task_id)
         if not task:
             raise TaskNotFound(str(task_id))
 
-        # Authorization: only task owner or system can cancel
-        if principal.kind != PrincipalKind.SYSTEM:
-            if task.created_by.id != principal.id or task.created_by.kind != principal.kind:
+        owner_hint = self._resolve_obligation_owner(task.created_by)
+        obligation = await self._get_task_obligation_or_raise(
+            tenant_id=tenant_id,
+            task_id=task_id,
+            owner_hint=owner_hint,
+        )
+        owner = obligation.to_
+        parents = [obligation.receipt_id]
+
+        # Authorization: only task owner or auth-authorized internal actors can cancel
+        if not actor_is_internal:
+            if owner.kind == PrincipalKind.SYSTEM and owner.id == SYSTEM_PRINCIPAL_ID:
+                raise UnauthorizedError(
+                    "Internal authorization required to cancel system-owned tasks"
+                )
+            if owner.id != principal.id or owner.kind != principal.kind:
                 raise UnauthorizedError(
                     f"Principal {principal.kind.value}:{principal.id} "
                     f"not authorized to cancel task owned by "
-                    f"{task.created_by.kind.value}:{task.created_by.id}"
+                    f"{owner.kind.value}:{owner.id}"
                 )
 
         if task.is_terminal():
@@ -273,8 +365,23 @@ class AsyncGateEngine:
             # 2. Cancel the task
             task = await self.tasks.cancel(tenant_id, task_id, reason)
 
-            # 3. Emit result_ready receipt to owner
-            await self._emit_result_ready_receipt(tenant_id, task)
+            # 3. Emit task.canceled receipt to owner
+            await self._emit_receipt(
+                tenant_id=tenant_id,
+                receipt_type=ReceiptType.TASK_CANCELED,
+                from_principal=principal,
+                to_principal=owner,
+                task_id=task.task_id,
+                parents=parents,
+                body={
+                    "canceled_by": {"kind": principal.kind.value, "id": principal.id},
+                    "reason": reason,
+                    "canceled_at": utc_now().isoformat(),
+                },
+            )
+
+            # 4. Emit result_ready receipt to owner
+            await self._emit_result_ready_receipt(tenant_id, task, owner=owner, parents=parents)
 
         return {"ok": True, "status": task.status.value}
 
@@ -287,6 +394,7 @@ class AsyncGateEngine:
         limit: int | None = None,
     ) -> dict[str, Any]:
         """List receipts for a principal."""
+        to_id = normalize_external(to_id)
         limit = min(limit or settings.default_list_limit, settings.max_list_limit)
 
         receipts, next_cursor = await self.receipts.list(
@@ -313,13 +421,14 @@ class AsyncGateEngine:
 
         Implemented as append-only receipt.acknowledged receipt, not a mutable flag.
         """
-        asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+        principal = self._normalize_principal(principal)
+        service_principal = self._service_principal()
 
         await self._emit_receipt(
             tenant_id=tenant_id,
             receipt_type=ReceiptType.RECEIPT_ACKNOWLEDGED,
             from_principal=principal,
-            to_principal=asyncgate_principal,
+            to_principal=service_principal,
             body={"acknowledged_receipt_id": str(receipt_id)},
             parents=[receipt_id],
         )
@@ -364,17 +473,25 @@ class AsyncGateEngine:
         for lease in leases:
             task = await self.tasks.get(tenant_id, lease.task_id)
             if task:
+                owner_hint = self._resolve_obligation_owner(task.created_by)
+                obligation = await self._get_task_obligation(
+                    tenant_id,
+                    task.task_id,
+                    owner_hint=owner_hint,
+                )
+                owner = obligation.to_ if obligation else owner_hint
+                parents = [obligation.receipt_id] if obligation else None
+
                 # Emit task.accepted receipt
                 worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
-                asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
-
                 await self._emit_receipt(
                     tenant_id=tenant_id,
                     receipt_type=ReceiptType.TASK_ACCEPTED,
                     from_principal=worker_principal,
-                    to_principal=asyncgate_principal,
+                    to_principal=owner,
                     task_id=task.task_id,
                     lease_id=lease.lease_id,
+                    parents=parents,
                     body=ReceiptBody.task_accepted(
                         worker_capabilities=capabilities or [],
                     ),
@@ -439,17 +556,22 @@ class AsyncGateEngine:
         # Update progress
         await self.progress.update(tenant_id, task_id, progress_data)
 
+        task = await self.tasks.get(tenant_id, task_id)
+        owner_hint = self._resolve_obligation_owner(task.created_by) if task else None
+        obligation = await self._get_task_obligation(tenant_id, task_id, owner_hint)
+        owner = obligation.to_ if obligation else (owner_hint or self._system_owner())
+        parents = [obligation.receipt_id] if obligation else None
+
         # Emit progress receipt
         worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
-        asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
-
         await self._emit_receipt(
             tenant_id=tenant_id,
             receipt_type=ReceiptType.TASK_PROGRESS,
             from_principal=worker_principal,
-            to_principal=asyncgate_principal,
+            to_principal=owner,
             task_id=task_id,
             lease_id=lease_id,
+            parents=parents,
             body={"progress": progress_data},
         )
 
@@ -462,7 +584,7 @@ class AsyncGateEngine:
         task_id: UUID,
         lease_id: UUID,
         result: dict[str, Any],
-        artifacts: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Mark a task as successfully completed.
@@ -482,6 +604,15 @@ class AsyncGateEngine:
         if not task.can_transition_to(TaskStatus.SUCCEEDED):
             raise InvalidStateTransition(task.status.value, TaskStatus.SUCCEEDED.value)
 
+        owner_hint = self._resolve_obligation_owner(task.created_by)
+        obligation = await self._get_task_obligation_or_raise(
+            tenant_id=tenant_id,
+            task_id=task_id,
+            owner_hint=owner_hint,
+        )
+        owner = obligation.to_
+        parents = [obligation.receipt_id]
+
         # P0.2: ATOMIC BLOCK - All or nothing
         async with self.session.begin_nested():  # SAVEPOINT
             # 1. Update task to succeeded
@@ -489,7 +620,7 @@ class AsyncGateEngine:
                 outcome=Outcome.SUCCEEDED,
                 result=result,
                 artifacts=artifacts,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=utc_now(),
             )
             await self.tasks.update_status(tenant_id, task_id, TaskStatus.SUCCEEDED, task_result)
 
@@ -498,15 +629,14 @@ class AsyncGateEngine:
 
             # 3. Emit task.completed receipt
             worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
-            asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
-
             await self._emit_receipt(
                 tenant_id=tenant_id,
                 receipt_type=ReceiptType.TASK_COMPLETED,
                 from_principal=worker_principal,
-                to_principal=asyncgate_principal,
+                to_principal=owner,
                 task_id=task_id,
                 lease_id=lease_id,
+                parents=parents,
                 body=ReceiptBody.task_completed(
                     result_summary="Task completed successfully",
                     result_payload=result,
@@ -516,7 +646,7 @@ class AsyncGateEngine:
 
             # 4. Emit result_ready to task owner
             task = await self.tasks.get(tenant_id, task_id)
-            await self._emit_result_ready_receipt(tenant_id, task)
+            await self._emit_result_ready_receipt(tenant_id, task, owner=owner, parents=parents)
         
         # If we reach here, all operations succeeded and were committed
         return {"ok": True}
@@ -551,24 +681,36 @@ class AsyncGateEngine:
         # Check if should retry (decision logic outside transaction)
         should_requeue = retryable and (task.attempt + 1) < task.max_attempts
 
+        owner_hint = self._resolve_obligation_owner(task.created_by)
+        obligation = await self._get_task_obligation_or_raise(
+            tenant_id=tenant_id,
+            task_id=task_id,
+            owner_hint=owner_hint,
+        )
+        owner = obligation.to_
+        parents = [obligation.receipt_id]
+
         # P0.2: ATOMIC BLOCK - All state changes + receipts
         async with self.session.begin_nested():  # SAVEPOINT
             # 1. Release lease first (common to both paths)
             await self.leases.release(tenant_id, task_id)
+
+            worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
 
             if should_requeue:
                 # REQUEUE PATH: Task gets another attempt
                 task = await self.tasks.requeue_with_backoff(tenant_id, task_id, increment_attempt=True)
                 next_eligible_at = task.next_eligible_at
                 
-                # Emit task.requeued receipt to task owner (agent-visible)
-                asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+                # Emit retry scheduled receipt to task owner (non-terminal)
                 await self._emit_receipt(
                     tenant_id=tenant_id,
-                    receipt_type=ReceiptType.TASK_FAILED,
-                    from_principal=asyncgate_principal,
-                    to_principal=task.created_by,
+                    receipt_type=ReceiptType.TASK_RETRY_SCHEDULED,
+                    from_principal=worker_principal,
+                    to_principal=owner,
                     task_id=task_id,
+                    lease_id=lease_id,
+                    parents=parents,
                     body={
                         "reason": "Worker reported retryable failure",
                         "error": error,
@@ -583,32 +725,30 @@ class AsyncGateEngine:
                 task_result = TaskResult(
                     outcome=Outcome.FAILED,
                     error=error,
-                    completed_at=datetime.now(timezone.utc),
+                    completed_at=utc_now(),
                 )
                 await self.tasks.update_status(tenant_id, task_id, TaskStatus.FAILED, task_result)
 
+                # Emit task.failed receipt to owner
+                await self._emit_receipt(
+                    tenant_id=tenant_id,
+                    receipt_type=ReceiptType.TASK_FAILED,
+                    from_principal=worker_principal,
+                    to_principal=owner,
+                    task_id=task_id,
+                    lease_id=lease_id,
+                    parents=parents,
+                    body=ReceiptBody.task_failed(
+                        error=error,
+                        retry_recommended=False,
+                    ),
+                )
+
                 # Emit result_ready to task owner
                 task = await self.tasks.get(tenant_id, task_id)
-                await self._emit_result_ready_receipt(tenant_id, task)
+                await self._emit_result_ready_receipt(tenant_id, task, owner=owner, parents=parents)
                 
                 next_eligible_at = None
-
-            # 2. Emit worker's task.failed receipt (system record, common to both paths)
-            worker_principal = Principal(kind=PrincipalKind.WORKER, id=worker_id)
-            asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
-
-            await self._emit_receipt(
-                tenant_id=tenant_id,
-                receipt_type=ReceiptType.TASK_FAILED,
-                from_principal=worker_principal,
-                to_principal=asyncgate_principal,
-                task_id=task_id,
-                lease_id=lease_id,
-                body=ReceiptBody.task_failed(
-                    error=error,
-                    retry_recommended=retryable,
-                ),
-            )
         
         # If we reach here, all operations succeeded and were committed
         return {
@@ -655,6 +795,15 @@ class AsyncGateEngine:
             if not task or task.is_terminal():
                 continue
 
+            owner_hint = self._resolve_obligation_owner(task.created_by)
+            obligation = await self._get_task_obligation(
+                lease.tenant_id,
+                lease.task_id,
+                owner_hint=owner_hint,
+            )
+            owner = obligation.to_ if obligation else owner_hint
+            parents = [obligation.receipt_id] if obligation else None
+
             # Add jitter to requeue time: 0-5 seconds random delay
             # This prevents all expired tasks from becoming eligible simultaneously
             jitter_seconds = random.uniform(0, 5)
@@ -676,15 +825,16 @@ class AsyncGateEngine:
                     await self.leases.release(lease.tenant_id, lease.task_id)
 
                     # 3. Emit lease.expired receipt to task owner
-                    asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+                    service_principal = self._service_principal()
 
                     await self._emit_receipt(
                         tenant_id=lease.tenant_id,
                         receipt_type=ReceiptType.LEASE_EXPIRED,
-                        from_principal=asyncgate_principal,
-                        to_principal=task.created_by,
+                        from_principal=service_principal,
+                        to_principal=owner,
                         task_id=task.task_id,
                         lease_id=lease.lease_id,
+                        parents=parents,
                         body=ReceiptBody.lease_expired(
                             task_id=task.task_id,
                             previous_worker_id=lease.worker_id,
@@ -792,6 +942,7 @@ class AsyncGateEngine:
         An obligation is "open" if no terminator receipt exists that references
         it as a parent. Termination is detected via DB, not semantic inference.
         """
+        principal = self._normalize_principal(principal)
         obligations, next_cursor = await self.receipts.list_open_obligations(
             tenant_id=tenant_id,
             to_kind=principal.kind,
@@ -832,17 +983,6 @@ class AsyncGateEngine:
         parents: list[UUID] | None = None,
     ) -> Receipt:
         """Emit a receipt (either locally or to MemoryGate)."""
-        # Compute hash for idempotency (includes all identifying fields)
-        receipt_hash = self._compute_receipt_hash(
-            receipt_type=receipt_type,
-            task_id=task_id,
-            from_principal=from_principal,
-            to_principal=to_principal,
-            lease_id=lease_id,
-            body=body,
-            parents=parents,  # P0.5: Include parents in hash
-        )
-
         return await self.receipts.create(
             tenant_id=tenant_id,
             receipt_type=receipt_type,
@@ -853,23 +993,27 @@ class AsyncGateEngine:
             schedule_id=schedule_id,
             parents=parents,
             body=body,
-            receipt_hash=receipt_hash,
+            receipt_hash=None,
         )
 
     async def _emit_result_ready_receipt(
         self,
         tenant_id: UUID,
         task: Task,
+        owner: Principal | None = None,
+        parents: list[UUID] | None = None,
     ) -> Receipt:
         """Emit task.result_ready receipt to task owner."""
-        asyncgate_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+        service_principal = self._service_principal()
+        to_principal = owner or task.created_by
 
         return await self._emit_receipt(
             tenant_id=tenant_id,
             receipt_type=ReceiptType.TASK_RESULT_READY,
-            from_principal=asyncgate_principal,
-            to_principal=task.created_by,
+            from_principal=service_principal,
+            to_principal=to_principal,
             task_id=task.task_id,
+            parents=parents,
             body=ReceiptBody.task_result_ready(
                 status=task.status.value,
                 result_payload=task.result.result if task.result else None,
@@ -903,29 +1047,15 @@ class AsyncGateEngine:
         
         Returns full 64-character SHA256 hex digest.
         """
-        # Create canonical body hash if body exists
-        body_hash = None
-        if body:
-            # P1.3: Use canonical JSON with separators for stability
-            body_canonical = json.dumps(body, sort_keys=True, separators=(',', ':'))
-            body_hash = hashlib.sha256(body_canonical.encode()).hexdigest()
-        
-        # Build receipt key from all identifying fields INCLUDING PARENTS
-        data = {
-            "receipt_type": receipt_type.value,
-            "task_id": str(task_id) if task_id else None,
-            "from_kind": from_principal.kind.value,
-            "from_id": from_principal.id,
-            "to_kind": to_principal.kind.value,
-            "to_id": to_principal.id,
-            "lease_id": str(lease_id) if lease_id else None,
-            "parents": sorted([str(p) for p in (parents or [])]),  # P0.5: Include parents
-            "body_hash": body_hash,
-        }
-        # P1.3: Use canonical JSON serialization
-        content = json.dumps(data, sort_keys=True, separators=(',', ':'))
-        # Return full 64-char hex digest (no truncation)
-        return hashlib.sha256(content.encode()).hexdigest()
+        return compute_receipt_hash(
+            receipt_type=receipt_type,
+            task_id=task_id,
+            from_principal=from_principal,
+            to_principal=to_principal,
+            lease_id=lease_id,
+            body=body,
+            parents=parents,
+        )
 
     def _task_to_dict(self, task: Task) -> dict[str, Any]:
         """Convert task to dictionary with native types."""

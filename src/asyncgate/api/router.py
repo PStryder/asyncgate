@@ -32,7 +32,7 @@ from asyncgate.api.schemas import (
     ReportProgressResponse,
     TaskResponse,
 )
-from asyncgate.api.deps import get_db_session, get_tenant_id, verify_api_key
+from asyncgate.api.deps import AuthContext, get_db_session, get_tenant_id, verify_api_key
 from asyncgate.middleware.rate_limit import rate_limit_dependency
 from asyncgate.engine import (
     AsyncGateEngine,
@@ -44,6 +44,7 @@ from asyncgate.engine import (
     UnauthorizedError,
 )
 from asyncgate.models import Principal, PrincipalKind
+from asyncgate.principals import is_internal_principal_id, normalize_external
 from asyncgate.models.enums import TaskStatus
 
 router = APIRouter(
@@ -69,6 +70,15 @@ def validate_task_status(value: Optional[str]) -> Optional[str]:
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid status: {value}")
     return value
+
+
+def ensure_internal_principal_allowed(principal_id: str, auth: AuthContext) -> None:
+    """Block internal principal IDs unless caller is authenticated as internal."""
+    if is_internal_principal_id(principal_id) and not auth.is_internal:
+        raise HTTPException(
+            status_code=403,
+            detail="Internal principal IDs require authenticated internal access",
+        )
 
 
 # ============================================================================
@@ -112,6 +122,7 @@ async def get_open_obligations(
     limit: Optional[int] = Query(None, ge=1, le=200),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """
     Get open obligations for a principal (obligation ledger model).
@@ -126,6 +137,8 @@ async def get_open_obligations(
     
     engine = AsyncGateEngine(session)
 
+    principal_id = normalize_external(principal_id)
+    ensure_internal_principal_allowed(principal_id, auth)
     principal = Principal(
         kind=parse_principal_kind(principal_kind),
         id=principal_id,
@@ -190,6 +203,7 @@ async def bootstrap(
     max_items: Optional[int] = Query(None, ge=1, le=200),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """
     Bootstrap session and get attention-aware status.
@@ -209,6 +223,8 @@ async def bootstrap(
     
     engine = AsyncGateEngine(session)
 
+    principal_id = normalize_external(principal_id)
+    ensure_internal_principal_allowed(principal_id, auth)
     principal = Principal(
         kind=parse_principal_kind(principal_kind),
         id=principal_id,
@@ -247,27 +263,34 @@ async def create_task(
     principal_id: str = Query(...),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """Create a new task."""
     engine = AsyncGateEngine(session)
 
+    principal_id = normalize_external(principal_id)
+    ensure_internal_principal_allowed(principal_id, auth)
     created_by = Principal(
         kind=parse_principal_kind(principal_kind),
         id=principal_id,
     )
 
-    result = await engine.create_task(
-        tenant_id=tenant_id,
-        type=request.type,
-        payload=request.payload,
-        created_by=created_by,
-        requirements=request.requirements,
-        priority=request.priority,
-        idempotency_key=request.idempotency_key,
-        max_attempts=request.max_attempts,
-        retry_backoff_seconds=request.retry_backoff_seconds,
-        delay_seconds=request.delay_seconds,
-    )
+    try:
+        result = await engine.create_task(
+            tenant_id=tenant_id,
+            type=request.type,
+            payload=request.payload,
+            created_by=created_by,
+            requirements=request.requirements,
+            priority=request.priority,
+            idempotency_key=request.idempotency_key,
+            max_attempts=request.max_attempts,
+            retry_backoff_seconds=request.retry_backoff_seconds,
+            delay_seconds=request.delay_seconds,
+            actor_is_internal=auth.is_internal,
+        )
+    except UnauthorizedError as e:
+        raise HTTPException(status_code=403, detail=e.message)
 
     return CreateTaskResponse(**result)
 
@@ -296,11 +319,15 @@ async def list_tasks(
     cursor: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """List tasks with optional filtering."""
     engine = AsyncGateEngine(session)
 
     status = validate_task_status(status)
+    if created_by:
+        created_by = normalize_external(created_by)
+        ensure_internal_principal_allowed(created_by, auth)
     result = await engine.list_tasks(
         tenant_id=tenant_id,
         status=status,
@@ -319,13 +346,16 @@ async def cancel_task(
     request: CancelTaskRequest,
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """Cancel a task."""
     engine = AsyncGateEngine(session)
 
+    normalized_principal_id = normalize_external(request.principal_id)
+    ensure_internal_principal_allowed(normalized_principal_id, auth)
     principal = Principal(
         kind=parse_principal_kind(request.principal_kind),
-        id=request.principal_id,
+        id=normalized_principal_id,
     )
 
     try:
@@ -334,6 +364,7 @@ async def cancel_task(
             task_id=task_id,
             principal=principal,
             reason=request.reason,
+            actor_is_internal=auth.is_internal,
         )
         return CancelTaskResponse(**result)
     except TaskNotFound as e:
@@ -355,11 +386,14 @@ async def list_receipts(
     limit: Optional[int] = Query(None, ge=1, le=200),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """List receipts for a principal."""
     engine = AsyncGateEngine(session)
 
     _ = parse_principal_kind(to_kind)
+    to_id = normalize_external(to_id)
+    ensure_internal_principal_allowed(to_id, auth)
     result = await engine.list_receipts(
         tenant_id=tenant_id,
         to_kind=to_kind,
@@ -377,13 +411,16 @@ async def ack_receipt(
     request: AckReceiptRequest,
     session: AsyncSession = Depends(get_db_session),
     tenant_id: UUID = Depends(get_tenant_id),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     """Acknowledge a receipt."""
     engine = AsyncGateEngine(session)
 
+    normalized_principal_id = normalize_external(request.principal_id)
+    ensure_internal_principal_allowed(normalized_principal_id, auth)
     principal = Principal(
         kind=parse_principal_kind(request.principal_kind),
-        id=request.principal_id,
+        id=normalized_principal_id,
     )
 
     result = await engine.ack_receipt(

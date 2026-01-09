@@ -2,7 +2,8 @@
 
 import logging
 import secrets
-from typing import AsyncGenerator, Optional
+from dataclasses import dataclass
+from typing import AsyncGenerator, Literal, Optional, TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException
@@ -11,8 +12,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from asyncgate.config import Environment, settings
 from asyncgate.db.base import async_session_factory
 
+if TYPE_CHECKING:
+    from asyncgate.auth.models import User
+
 
 logger = logging.getLogger("asyncgate.api")
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    """Authentication context for the current request."""
+
+    user: "User | None"
+    auth_type: Literal["db_api_key", "legacy_api_key", "insecure_dev"]
+    is_internal: bool
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -52,13 +65,15 @@ async def verify_api_key(
     authorization: str | None = Header(None),
     x_api_key: str | None = Header(None, alias="X-API-Key"),
     session: AsyncSession = Depends(get_db_session),
-) -> bool:
+) -> AuthContext:
     """
     Verify API key authentication.
 
     Supports two modes:
     1. Database-backed API keys (ag_... prefix) - validates against auth_api_keys table
     2. Legacy shared token (ASYNCGATE_API_KEY env var) - for backward compatibility
+
+    Returns AuthContext on success. Raises HTTPException on failure.
 
     Security: Fails closed - if neither mode is configured and we're not
     in explicit insecure dev mode, all requests are rejected.
@@ -67,7 +82,7 @@ async def verify_api_key(
 
     # Insecure dev mode bypass (must be explicitly enabled)
     if settings.allow_insecure_dev and settings.env == Environment.DEVELOPMENT:
-        return True
+        return AuthContext(user=None, auth_type="insecure_dev", is_internal=False)
 
     # Extract API key from headers
     api_key = None
@@ -94,13 +109,17 @@ async def verify_api_key(
         if user:
             if not user.is_active:
                 raise HTTPException(status_code=403, detail="User account is inactive")
-            return True
+            return AuthContext(
+                user=user,
+                auth_type="db_api_key",
+                is_internal=bool(user.is_admin),
+            )
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     # Fallback: Legacy shared token validation
     if settings.api_key:
         if secrets.compare_digest(api_key, settings.api_key):
-            return True
+            return AuthContext(user=None, auth_type="legacy_api_key", is_internal=False)
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     # No valid auth method configured

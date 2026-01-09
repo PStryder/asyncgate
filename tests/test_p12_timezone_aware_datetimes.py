@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from asyncgate.db.repositories import TaskRepository, LeaseRepository, ReceiptRepository
 from asyncgate.engine import AsyncGateEngine
 from asyncgate.models import Principal, PrincipalKind, TaskStatus, ReceiptType
+from asyncgate.principals import SYSTEM_PRINCIPAL_ID
 
 
 @pytest.mark.asyncio
@@ -52,12 +53,12 @@ async def test_task_completed_at_is_timezone_aware(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create and claim task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -77,6 +78,7 @@ async def test_task_completed_at_is_timezone_aware(session: AsyncSession):
         task_id=task_id,
         lease_id=lease.lease_id,
         result={"status": "done"},
+        artifacts=[{"type": "test", "uri": "mem://timezone/completed"}],
     )
     
     await session.commit()
@@ -221,7 +223,7 @@ async def test_receipt_created_at_is_timezone_aware(session: AsyncSession):
     engine = AsyncGateEngine(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     # Create receipt
     receipt = await engine.receipts.create(

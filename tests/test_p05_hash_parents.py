@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.db.repositories import ReceiptRepository
 from asyncgate.models import Principal, PrincipalKind, ReceiptType
+from asyncgate.principals import SERVICE_PRINCIPAL_ID, SYSTEM_PRINCIPAL_ID
 
 
 @pytest.mark.asyncio
@@ -27,13 +28,33 @@ async def test_receipt_hash_includes_parents(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
+    service = Principal(kind=PrincipalKind.SERVICE, id=SERVICE_PRINCIPAL_ID)
+    service = Principal(kind=PrincipalKind.SERVICE, id=SERVICE_PRINCIPAL_ID)
     
     task_id = uuid4()
-    parent_a = uuid4()
-    parent_b = uuid4()
+    parent_a = await receipts.create(
+        tenant_id=tenant_id,
+        receipt_type=ReceiptType.TASK_ASSIGNED,
+        from_principal=service,
+        to_principal=agent,
+        task_id=task_id,
+        body={"task_type": "hash_parent_a"},
+    )
+    parent_b = await receipts.create(
+        tenant_id=tenant_id,
+        receipt_type=ReceiptType.TASK_ASSIGNED,
+        from_principal=service,
+        to_principal=agent,
+        task_id=task_id,
+        body={"task_type": "hash_parent_b"},
+    )
     
-    body = {"result": "completed", "status": "success"}
+    body = {
+        "result": "completed",
+        "status": "success",
+        "artifacts": [{"type": "test", "uri": "mem://hash/parents"}],
+    }
     
     # Create receipt 1 with parent A
     receipt1 = await receipts.create(
@@ -42,7 +63,7 @@ async def test_receipt_hash_includes_parents(session: AsyncSession):
         from_principal=system,
         to_principal=agent,
         task_id=task_id,
-        parents=[parent_a],
+        parents=[parent_a.receipt_id],
         body=body,
     )
     
@@ -55,7 +76,7 @@ async def test_receipt_hash_includes_parents(session: AsyncSession):
         from_principal=system,
         to_principal=agent,
         task_id=task_id,
-        parents=[parent_b],  # Different parent
+        parents=[parent_b.receipt_id],  # Different parent
         body=body,           # Same body
     )
     
@@ -69,8 +90,8 @@ async def test_receipt_hash_includes_parents(session: AsyncSession):
     assert receipt1.receipt_id != receipt2.receipt_id, \
         "Receipts should not dedupe when parents differ"
     
-    print(f"✅ Receipt 1 hash: {receipt1.hash[:16]}... (parent: {parent_a})")
-    print(f"✅ Receipt 2 hash: {receipt2.hash[:16]}... (parent: {parent_b})")
+    print(f"✅ Receipt 1 hash: {receipt1.hash[:16]}... (parent: {parent_a.receipt_id})")
+    print(f"✅ Receipt 2 hash: {receipt2.hash[:16]}... (parent: {parent_b.receipt_id})")
 
 
 @pytest.mark.asyncio
@@ -81,11 +102,19 @@ async def test_receipt_hash_dedupes_identical_receipts(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
+    service = Principal(kind=PrincipalKind.SERVICE, id=SERVICE_PRINCIPAL_ID)
     
     task_id = uuid4()
-    parent_id = uuid4()
-    body = {"result": "completed"}
+    parent = await receipts.create(
+        tenant_id=tenant_id,
+        receipt_type=ReceiptType.TASK_ASSIGNED,
+        from_principal=service,
+        to_principal=agent,
+        task_id=task_id,
+        body={"task_type": "hash_dedupe_parent"},
+    )
+    body = {"result": "completed", "artifacts": [{"type": "test", "uri": "mem://hash/dedupe"}]}
     
     # Create receipt 1
     receipt1 = await receipts.create(
@@ -94,7 +123,7 @@ async def test_receipt_hash_dedupes_identical_receipts(session: AsyncSession):
         from_principal=system,
         to_principal=agent,
         task_id=task_id,
-        parents=[parent_id],
+        parents=[parent.receipt_id],
         body=body,
     )
     
@@ -107,7 +136,7 @@ async def test_receipt_hash_dedupes_identical_receipts(session: AsyncSession):
         from_principal=system,
         to_principal=agent,
         task_id=task_id,
-        parents=[parent_id],  # Same parent
+        parents=[parent.receipt_id],  # Same parent
         body=body,            # Same body
     )
     
@@ -128,12 +157,27 @@ async def test_receipt_hash_parents_order_independent(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
+    service = Principal(kind=PrincipalKind.SERVICE, id=SERVICE_PRINCIPAL_ID)
     
     task_id = uuid4()
-    parent_a = uuid4()
-    parent_b = uuid4()
-    body = {"result": "completed"}
+    parent_a = await receipts.create(
+        tenant_id=tenant_id,
+        receipt_type=ReceiptType.TASK_ASSIGNED,
+        from_principal=service,
+        to_principal=agent,
+        task_id=task_id,
+        body={"task_type": "hash_order_parent_a"},
+    )
+    parent_b = await receipts.create(
+        tenant_id=tenant_id,
+        receipt_type=ReceiptType.TASK_ASSIGNED,
+        from_principal=service,
+        to_principal=agent,
+        task_id=task_id,
+        body={"task_type": "hash_order_parent_b"},
+    )
+    body = {"result": "completed", "artifacts": [{"type": "test", "uri": "mem://hash/order"}]}
     
     # Create receipt with parents [A, B]
     receipt1 = await receipts.create(
@@ -142,7 +186,7 @@ async def test_receipt_hash_parents_order_independent(session: AsyncSession):
         from_principal=system,
         to_principal=agent,
         task_id=task_id,
-        parents=[parent_a, parent_b],
+        parents=[parent_a.receipt_id, parent_b.receipt_id],
         body=body,
     )
     
@@ -155,7 +199,7 @@ async def test_receipt_hash_parents_order_independent(session: AsyncSession):
         from_principal=system,
         to_principal=agent,
         task_id=task_id,
-        parents=[parent_b, parent_a],  # Different order
+        parents=[parent_b.receipt_id, parent_a.receipt_id],  # Different order
         body=body,
     )
     
@@ -176,7 +220,7 @@ async def test_receipt_hash_empty_vs_no_parents(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     task_id = uuid4()
     body = {"action": "assigned"}
@@ -224,24 +268,37 @@ async def test_receipt_hash_canonical_json(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
+    task_id = uuid4()
+
     # Body with nested structure
     body = {
         "result": {
             "status": "success",
             "data": [1, 2, 3],
-            "metadata": {"key": "value"}
-        }
+            "metadata": {"key": "value"},
+        },
+        "artifacts": [{"type": "test", "uri": "mem://hash/canonical"}],
     }
     
+    parent = await receipts.create(
+        tenant_id=tenant_id,
+        receipt_type=ReceiptType.TASK_ASSIGNED,
+        from_principal=service,
+        to_principal=agent,
+        task_id=task_id,
+        body={"task_type": "hash_canonical_parent"},
+    )
+
     # Create receipt
     receipt = await receipts.create(
         tenant_id=tenant_id,
         receipt_type=ReceiptType.TASK_COMPLETED,
         from_principal=system,
         to_principal=agent,
-        task_id=uuid4(),
+        task_id=task_id,
+        parents=[parent.receipt_id],
         body=body,
     )
     
@@ -270,7 +327,7 @@ def test_hash_computation_algorithm():
     receipt_type = ReceiptType.TASK_COMPLETED
     task_id = uuid4()
     from_principal = Principal(kind=PrincipalKind.AGENT, id="agent-1")
-    to_principal = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    to_principal = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     lease_id = uuid4()
     body = {"result": "success"}
     

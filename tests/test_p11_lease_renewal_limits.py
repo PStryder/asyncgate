@@ -336,6 +336,98 @@ async def test_new_lease_after_limit_works(session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_claim_and_renew_return_tracking_fields(session: AsyncSession):
+    """
+    Test that lease claim/renew returns acquired_at and renewal_count.
+    """
+    engine = AsyncGateEngine(session)
+    tenant_id = uuid4()
+    worker_id = "test-worker"
+    agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
+
+    task_id = (await engine.create_task(
+        tenant_id=tenant_id,
+        type="test_task",
+        payload={"data": "test"},
+        created_by=agent,
+    ))["task_id"]
+
+    await session.commit()
+
+    leases = await engine.leases.claim_next(
+        tenant_id=tenant_id,
+        worker_id=worker_id,
+        max_tasks=1,
+    )
+    lease = leases[0]
+
+    assert lease.acquired_at is not None, "acquired_at should be populated on claim"
+    assert lease.renewal_count == 0, "renewal_count should start at 0"
+
+    await session.commit()
+
+    renewed = await engine.leases.renew(
+        tenant_id=tenant_id,
+        task_id=task_id,
+        lease_id=lease.lease_id,
+        worker_id=worker_id,
+    )
+
+    assert renewed is not None, "Renewal should return a lease"
+    assert renewed.acquired_at == lease.acquired_at, "acquired_at should be preserved on renew"
+    assert renewed.renewal_count == 1, "renewal_count should increment on renew"
+
+    print("OK. Lease claim/renew tracking fields verified")
+
+
+@pytest.mark.asyncio
+async def test_expire_leases_returns_without_validation_errors(session: AsyncSession):
+    """
+    Test that lease expiry path works without validation errors.
+    """
+    engine = AsyncGateEngine(session)
+    tenant_id = uuid4()
+    worker_id = "test-worker"
+    agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
+
+    task_id = (await engine.create_task(
+        tenant_id=tenant_id,
+        type="test_task",
+        payload={"data": "test"},
+        created_by=agent,
+    ))["task_id"]
+
+    await session.commit()
+
+    leases = await engine.leases.claim_next(
+        tenant_id=tenant_id,
+        worker_id=worker_id,
+        max_tasks=1,
+    )
+    lease = leases[0]
+
+    await session.commit()
+
+    from asyncgate.db.tables import LeaseTable
+    from sqlalchemy import update
+
+    await session.execute(
+        update(LeaseTable)
+        .where(LeaseTable.lease_id == lease.lease_id)
+        .values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=10))
+    )
+    await session.commit()
+
+    expired = await engine.expire_leases(batch_size=1)
+    assert expired >= 1, "Expected at least one lease to expire"
+
+    task = await engine.tasks.get(tenant_id, task_id)
+    assert task.status == TaskStatus.QUEUED, "Expired task should be requeued"
+
+    print("OK. Lease expiry path verified")
+
+
+@pytest.mark.asyncio
 async def test_config_values_respected(session: AsyncSession):
     """
     Test that config values for limits are actually used.

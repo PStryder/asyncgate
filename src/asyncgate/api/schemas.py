@@ -199,7 +199,7 @@ class CompleteTaskRequest(BaseModel):
     worker_id: str
     lease_id: UUID
     result: dict[str, Any]
-    artifacts: Optional[dict[str, Any]] = None
+    artifacts: Optional[list[dict[str, Any]] | dict[str, Any]] = None
 
 
 class CompleteTaskResponse(BaseModel):

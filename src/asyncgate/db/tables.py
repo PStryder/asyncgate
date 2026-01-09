@@ -69,7 +69,9 @@ class TaskTable(Base):
     result_outcome: Mapped[str | None] = mapped_column(String(50), nullable=True)
     result_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     result_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    result_artifacts: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    result_artifacts: Mapped[dict[str, Any] | list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
+    )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Instance ownership

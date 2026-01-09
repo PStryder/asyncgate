@@ -13,6 +13,7 @@ from httpx import AsyncClient
 from uuid import uuid4
 
 from asyncgate.models import Principal, PrincipalKind, ReceiptType
+from asyncgate.principals import SYSTEM_PRINCIPAL_ID
 from asyncgate.db.repositories import ReceiptRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +28,6 @@ async def test_obligations_open_returns_flat_list(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
     
     # Create 20 obligations of different types
     obligation_types = [
@@ -56,7 +56,7 @@ async def test_obligations_open_returns_flat_list(session: AsyncSession):
     open_oblig, cursor = await receipts.list_open_obligations(
         tenant_id=tenant_id,
         to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_id=SYSTEM_PRINCIPAL_ID,
         limit=100,
     )
     
@@ -97,7 +97,7 @@ async def test_obligations_open_api_returns_flat_json(
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     # Create 10 obligations
     for i in range(10):
@@ -105,7 +105,7 @@ async def test_obligations_open_api_returns_flat_json(
             tenant_id=tenant_id,
             receipt_type=ReceiptType.TASK_ASSIGNED,
             from_principal=agent,
-            to_principal=system,
+            to_principal=agent,
             task_id=uuid4(),
             body={"index": i},
         )
@@ -114,24 +114,25 @@ async def test_obligations_open_api_returns_flat_json(
     
     # Call API endpoint
     response = await client.get(
-        f"/v1/obligations/open?to_kind={PrincipalKind.SYSTEM.value}&to_id=asyncgate",
+        f"/v1/obligations/open?principal_kind={PrincipalKind.AGENT.value}&principal_id={agent.id}",
         headers={"X-Tenant-ID": str(tenant_id)},
     )
     
     assert response.status_code == 200
     data = response.json()
     
-    # CRITICAL: Response must be a flat array at top level
-    assert isinstance(data, list), \
-        f"API must return flat array, got {type(data).__name__}"
+    # CRITICAL: Response must include a flat open_obligations list
+    assert isinstance(data, dict), \
+        f"API must return object, got {type(data).__name__}"
+    assert "open_obligations" in data, "Response must include open_obligations"
     
-    # Verify not nested under any key
-    assert not isinstance(data, dict), \
-        "API must not return bucketed/grouped structure"
+    open_obligations = data["open_obligations"]
+    assert isinstance(open_obligations, list), \
+        "open_obligations must be a flat list"
     
     # Each item should be a receipt object
-    if len(data) > 0:
-        first_item = data[0]
+    if len(open_obligations) > 0:
+        first_item = open_obligations[0]
         assert isinstance(first_item, dict), "Each item should be a receipt object"
         assert "receipt_id" in first_item, "Receipts must have receipt_id"
         assert "receipt_type" in first_item, "Receipts must have receipt_type"
@@ -141,7 +142,7 @@ async def test_obligations_open_api_returns_flat_json(
         assert "category" not in first_item, "Receipts must not have category metadata"
         assert "priority" not in first_item, "Receipts must not have priority metadata"
     
-    print(f"✅ API returned flat JSON array of {len(data)} obligations")
+    print(f"OK. API returned flat JSON array of {len(open_obligations)} obligations")
 
 
 @pytest.mark.asyncio
@@ -160,7 +161,7 @@ async def test_no_attention_heuristics(session: AsyncSession):
     receipts = ReceiptRepository(session)
     tenant_id = uuid4()
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
-    system = Principal(kind=PrincipalKind.SYSTEM, id="asyncgate")
+    system = Principal(kind=PrincipalKind.SYSTEM, id=SYSTEM_PRINCIPAL_ID)
     
     # Create obligations with varying "importance" signals
     obligations = [
@@ -189,7 +190,7 @@ async def test_no_attention_heuristics(session: AsyncSession):
     open_oblig, _ = await receipts.list_open_obligations(
         tenant_id=tenant_id,
         to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_id=SYSTEM_PRINCIPAL_ID,
         limit=100,
     )
     

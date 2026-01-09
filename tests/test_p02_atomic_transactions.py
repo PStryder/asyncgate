@@ -30,12 +30,12 @@ async def test_complete_atomicity_receipt_failure_rollsback(session: AsyncSessio
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create a task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -75,6 +75,7 @@ async def test_complete_atomicity_receipt_failure_rollsback(session: AsyncSessio
             task_id=task_id,
             lease_id=lease.lease_id,
             result={"status": "done"},
+            artifacts=[{"type": "test", "uri": "mem://complete/atomicity"}],
         )
     
     # Rollback the failed transaction
@@ -106,13 +107,13 @@ async def test_fail_atomicity_requeue_path(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create task with retries
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
         max_attempts=3,  # Allow retries
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -134,8 +135,8 @@ async def test_fail_atomicity_requeue_path(session: AsyncSession):
         nonlocal call_count
         call_count += 1
         
-        # Fail on second receipt
-        if call_count >= 2:
+        # Fail on first receipt (retryable path emits one receipt)
+        if call_count >= 1:
             raise ValueError("Simulated failure")
         
         return await original_create(*args, **kwargs)
@@ -175,12 +176,12 @@ async def test_cancel_atomicity(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -222,12 +223,12 @@ async def test_expire_leases_atomicity(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create and claim task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -285,12 +286,12 @@ async def test_complete_success_all_committed(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create and claim task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -310,6 +311,7 @@ async def test_complete_success_all_committed(session: AsyncSession):
         task_id=task_id,
         lease_id=lease.lease_id,
         result={"status": "done"},
+        artifacts=[{"type": "test", "uri": "mem://complete/success"}],
     )
     
     await session.commit()
@@ -329,8 +331,8 @@ async def test_complete_success_all_committed(session: AsyncSession):
     # Verify receipts created
     receipts, _ = await engine.receipts.list(
         tenant_id=tenant_id,
-        to_kind=PrincipalKind.SYSTEM,
-        to_id="asyncgate",
+        to_kind=PrincipalKind.AGENT,
+        to_id=agent.id,
         limit=10,
     )
     
@@ -355,13 +357,13 @@ async def test_fail_terminal_atomicity(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create task with no retries
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
         max_attempts=1,  # No retries
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     

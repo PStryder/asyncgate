@@ -1,6 +1,6 @@
 """Database repositories for AsyncGate entities."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -9,6 +9,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from asyncgate.config import settings
+from asyncgate.constants import (
+    MAX_RECEIPT_ARTIFACTS,
+    MAX_RECEIPT_BODY_BYTES,
+    MAX_RECEIPT_PARENTS,
+)
 from asyncgate.db.tables import (
     AuditEventTable,
     LeaseTable,
@@ -32,11 +37,15 @@ from asyncgate.models import (
     TaskSummary,
 )
 from asyncgate.models.enums import Outcome
+from asyncgate.models.receipt import compute_receipt_hash
 from asyncgate.models.termination import (
     get_obligation_types,
     get_terminal_types,
     is_terminal_type,
+    TERMINAL_RECEIPT_TYPES,
 )
+from asyncgate.principals import SERVICE_PRINCIPAL_ID, principal_id_variants
+from asyncgate.utils.time import utc_now
 
 
 class TaskRepository:
@@ -65,7 +74,7 @@ class TaskRepository:
         unique constraint violation, then fetches existing task. This prevents
         race conditions from check-then-insert pattern.
         """
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         task_id = uuid4()
 
         next_eligible_at = now + timedelta(seconds=delay_seconds) if delay_seconds else None
@@ -134,7 +143,8 @@ class TaskRepository:
         if type:
             query = query.where(TaskTable.type == type)
         if created_by_id:
-            query = query.where(TaskTable.created_by_id == created_by_id)
+            created_by_ids = principal_id_variants(created_by_id)
+            query = query.where(TaskTable.created_by_id.in_(created_by_ids))
 
         # Cursor-based pagination
         if cursor:
@@ -161,7 +171,7 @@ class TaskRepository:
         result: TaskResult | None = None,
     ) -> Task | None:
         """Update task status."""
-        now = datetime.now(timezone.utc)
+        now = utc_now()
 
         values: dict[str, Any] = {
             "status": new_status,
@@ -192,7 +202,7 @@ class TaskRepository:
         result = TaskResult(
             outcome=Outcome.CANCELED,
             error={"reason": reason} if reason else None,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=utc_now(),
         )
 
         return await self.update_status(tenant_id, task_id, TaskStatus.CANCELED, result)
@@ -208,7 +218,7 @@ class TaskRepository:
         if not task:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         attempt = task.attempt + 1 if increment_attempt else task.attempt
 
         # Calculate backoff: base * 2^(attempt-1), capped at max
@@ -259,7 +269,7 @@ class TaskRepository:
         if not task:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         # CRITICAL: Do NOT increment attempt - lease expiry is "lost authority" not "task failed"
         attempt = task.attempt
         
@@ -345,7 +355,7 @@ class LeaseRepository:
         lease_ttl_seconds: int | None = None,
     ) -> list[Lease]:
         """Atomically claim next available tasks."""
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         ttl = min(
             lease_ttl_seconds or settings.default_lease_ttl_seconds,
             settings.max_lease_ttl_seconds,
@@ -413,6 +423,8 @@ class LeaseRepository:
                     worker_id=worker_id,
                     expires_at=expires_at,
                     created_at=now,
+                    acquired_at=now,
+                    renewal_count=0,
                 )
             )
 
@@ -444,7 +456,7 @@ class LeaseRepository:
                 LeaseTable.task_id == task_id,
                 LeaseTable.lease_id == lease_id,
                 LeaseTable.worker_id == worker_id,
-                LeaseTable.expires_at > datetime.now(timezone.utc),
+                LeaseTable.expires_at > utc_now(),
             )
         )
         row = result.scalar_one_or_none()
@@ -471,19 +483,21 @@ class LeaseRepository:
         """
         # Get the full lease record (including renewal_count and acquired_at)
         result = await self.session.execute(
-            select(LeaseTable).where(
+            select(LeaseTable)
+            .where(
                 LeaseTable.tenant_id == tenant_id,
                 LeaseTable.task_id == task_id,
                 LeaseTable.lease_id == lease_id,
                 LeaseTable.worker_id == worker_id,
             )
+            .with_for_update()
         )
         lease_row = result.scalar_one_or_none()
         
         if not lease_row:
             return None
         
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         
         # P1.1 ENFORCEMENT: Check renewal count limit
         if lease_row.renewal_count >= settings.max_lease_renewals:
@@ -534,6 +548,8 @@ class LeaseRepository:
             worker_id=lease_row.worker_id,
             expires_at=new_expires_at,
             created_at=lease_row.created_at,
+            acquired_at=lease_row.acquired_at,
+            renewal_count=lease_row.renewal_count + 1,
         )
 
     async def release(self, tenant_id: UUID, task_id: UUID) -> bool:
@@ -554,7 +570,7 @@ class LeaseRepository:
             limit: Maximum number of leases to return
             instance_id: Optional instance filter for multi-instance deployments
         """
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         
         # Build query with join to tasks for instance filtering
         query = (
@@ -587,6 +603,8 @@ class LeaseRepository:
             worker_id=row.worker_id,
             expires_at=row.expires_at,
             created_at=row.created_at,
+            acquired_at=row.acquired_at,
+            renewal_count=row.renewal_count,
         )
 
 
@@ -612,7 +630,7 @@ class ReceiptRepository:
         """Create a new receipt."""
         import json
         
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         receipt_id = uuid4()
 
         # T5.1: Receipt size limits - receipts are contracts, not chat
@@ -622,17 +640,18 @@ class ReceiptRepository:
         if body:
             body_json = json.dumps(body, separators=(',', ':'))
             body_size = len(body_json.encode('utf-8'))
-            if body_size > 65536:  # 64KB
+            if body_size > MAX_RECEIPT_BODY_BYTES:
                 raise ValueError(
-                    f"Receipt body too large: {body_size} bytes (max 64KB). "
+                    f"Receipt body too large: {body_size} bytes "
+                    f"(max {MAX_RECEIPT_BODY_BYTES} bytes). "
                     f"Receipt bodies are contracts, not chat messages. "
                     f"Store large payloads externally and reference via artifacts or delivery_proof."
                 )
         
         # Validate parents count (10 max - prevent mega-chains)
-        if parents and len(parents) > 10:
+        if parents and len(parents) > MAX_RECEIPT_PARENTS:
             raise ValueError(
-                f"Too many parent receipts: {len(parents)} (max 10). "
+                f"Too many parent receipts: {len(parents)} (max {MAX_RECEIPT_PARENTS}). "
                 f"Receipt bodies are contracts, not chat messages. "
                 f"Avoid creating deep chains - use flat structures where possible."
             )
@@ -640,18 +659,12 @@ class ReceiptRepository:
         # Validate artifacts count if present (100 max - prevent stuffing)
         if body and 'artifacts' in body:
             artifacts = body['artifacts']
-            if isinstance(artifacts, list) and len(artifacts) > 100:
+            if isinstance(artifacts, list) and len(artifacts) > MAX_RECEIPT_ARTIFACTS:
                 raise ValueError(
-                    f"Too many artifacts: {len(artifacts)} (max 100). "
+                    f"Too many artifacts: {len(artifacts)} (max {MAX_RECEIPT_ARTIFACTS}). "
                     f"Receipt bodies are contracts, not chat messages. "
                     f"If you have this many artifacts, you're doing it wrong."
                 )
-
-        # Check for duplicate by hash
-        if receipt_hash:
-            existing = await self._get_by_hash(tenant_id, receipt_hash)
-            if existing:
-                return existing
 
         # T1.1: Enforce parent linkage on terminal receipts
         if is_terminal_type(receipt_type):
@@ -702,6 +715,24 @@ class ReceiptRepository:
                 
                 # In Phase 2 (strict), this would raise ValueError instead
 
+        receipt_hash_to_use = receipt_hash
+        if not receipt_hash_to_use:
+            receipt_hash_to_use = compute_receipt_hash(
+                receipt_type=receipt_type,
+                task_id=task_id,
+                from_principal=from_principal,
+                to_principal=to_principal,
+                lease_id=lease_id,
+                body=body,
+                parents=parents_to_use,
+            )
+
+        # Check for duplicate by hash
+        if receipt_hash_to_use:
+            existing = await self._get_by_hash(tenant_id, receipt_hash_to_use)
+            if existing:
+                return existing
+
         receipt_row = ReceiptTable(
             tenant_id=tenant_id,
             receipt_id=receipt_id,
@@ -716,7 +747,7 @@ class ReceiptRepository:
             schedule_id=schedule_id,
             parents=[str(p) for p in (parents_to_use or [])],  # Use potentially stripped parents
             body=body or {},
-            hash=receipt_hash,
+            hash=receipt_hash_to_use,
             asyncgate_instance=settings.instance_id,
         )
 
@@ -729,9 +760,9 @@ class ReceiptRepository:
                 tenant_id=tenant_id,
                 receipt_id=uuid4(),
                 receipt_type=ReceiptType.SYSTEM_ANOMALY,
-                created_at=datetime.now(timezone.utc),
-                from_kind=PrincipalKind.SYSTEM,
-                from_id="asyncgate",
+                created_at=utc_now(),
+                from_kind=PrincipalKind.SERVICE,
+                from_id=SERVICE_PRINCIPAL_ID,
                 to_kind=to_principal.kind,
                 to_id=to_principal.id,
                 task_id=task_id,
@@ -764,10 +795,11 @@ class ReceiptRepository:
         limit: int = 50,
     ) -> tuple[list[Receipt], UUID | None]:
         """List receipts for a principal."""
+        to_ids = principal_id_variants(to_id)
         query = select(ReceiptTable).where(
             ReceiptTable.tenant_id == tenant_id,
             ReceiptTable.to_kind == to_kind,
-            ReceiptTable.to_id == to_id,
+            ReceiptTable.to_id.in_(to_ids),
         )
 
         if since_receipt_id:
@@ -806,7 +838,7 @@ class ReceiptRepository:
                 ReceiptTable.receipt_id.in_(receipt_ids),
                 ReceiptTable.delivered_at.is_(None),
             )
-            .values(delivered_at=datetime.now(timezone.utc))
+            .values(delivered_at=utc_now())
         )
         return result.rowcount
 
@@ -818,12 +850,13 @@ class ReceiptRepository:
         to_id: str,
     ) -> list[Receipt]:
         """Get undelivered receipts for a task."""
+        to_ids = principal_id_variants(to_id)
         result = await self.session.execute(
             select(ReceiptTable).where(
                 ReceiptTable.tenant_id == tenant_id,
                 ReceiptTable.task_id == task_id,
                 ReceiptTable.to_kind == to_kind,
-                ReceiptTable.to_id == to_id,
+                ReceiptTable.to_id.in_(to_ids),
                 ReceiptTable.delivered_at.is_(None),
             )
         )
@@ -837,11 +870,12 @@ class ReceiptRepository:
         receipt_type: ReceiptType,
     ) -> list[Receipt]:
         """Get undelivered receipts of a specific type for a principal."""
+        to_ids = principal_id_variants(to_id)
         result = await self.session.execute(
             select(ReceiptTable).where(
                 ReceiptTable.tenant_id == tenant_id,
                 ReceiptTable.to_kind == to_kind,
-                ReceiptTable.to_id == to_id,
+                ReceiptTable.to_id.in_(to_ids),
                 ReceiptTable.receipt_type == receipt_type,
                 ReceiptTable.delivered_at.is_(None),
             )
@@ -870,6 +904,32 @@ class ReceiptRepository:
                 ReceiptTable.tenant_id == tenant_id,
                 ReceiptTable.receipt_id == receipt_id,
             )
+        )
+        row = result.scalar_one_or_none()
+        return self._row_to_model(row) if row else None
+
+    async def get_task_obligation(
+        self,
+        tenant_id: UUID,
+        task_id: UUID,
+        owner: Principal | None = None,
+    ) -> Receipt | None:
+        """Get the obligation receipt associated with a task (task.assigned)."""
+        query = select(ReceiptTable).where(
+            ReceiptTable.tenant_id == tenant_id,
+            ReceiptTable.task_id == task_id,
+            ReceiptTable.receipt_type == ReceiptType.TASK_ASSIGNED,
+        )
+
+        if owner:
+            owner_ids = principal_id_variants(owner.id)
+            query = query.where(
+                ReceiptTable.to_kind == owner.kind,
+                ReceiptTable.to_id.in_(owner_ids),
+            )
+
+        result = await self.session.execute(
+            query.order_by(ReceiptTable.created_at.desc()).limit(1)
         )
         row = result.scalar_one_or_none()
         return self._row_to_model(row) if row else None
@@ -934,6 +994,7 @@ class ReceiptRepository:
             .where(
                 ReceiptTable.tenant_id == tenant_id,
                 ReceiptTable.parents.contains([parent_str]),
+                ReceiptTable.receipt_type.in_(TERMINAL_RECEIPT_TYPES),
             )
             .limit(1)
         )
@@ -959,8 +1020,19 @@ class ReceiptRepository:
         Returns:
             List of receipts that reference this parent, ordered by created_at
         """
-        # This is just an alias for get_by_parent with clearer semantics
-        return await self.get_by_parent(tenant_id, parent_receipt_id, limit)
+        parent_str = str(parent_receipt_id)
+
+        result = await self.session.execute(
+            select(ReceiptTable)
+            .where(
+                ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.parents.contains([parent_str]),
+                ReceiptTable.receipt_type.in_(TERMINAL_RECEIPT_TYPES),
+            )
+            .order_by(ReceiptTable.created_at.asc())
+            .limit(limit)
+        )
+        return [self._row_to_model(r) for r in result.scalars().all()]
 
     async def get_latest_terminator(
         self,
@@ -987,6 +1059,7 @@ class ReceiptRepository:
             .where(
                 ReceiptTable.tenant_id == tenant_id,
                 ReceiptTable.parents.contains([parent_str]),
+                ReceiptTable.receipt_type.in_(TERMINAL_RECEIPT_TYPES),
             )
             .order_by(ReceiptTable.created_at.desc())  # Most recent first
             .limit(1)
@@ -1040,10 +1113,11 @@ class ReceiptRepository:
         candidate_limit = min(limit * 3, 1000)
         
         # Base query: receipts to this principal of obligation types
+        to_ids = principal_id_variants(to_id)
         query = select(ReceiptTable).where(
             ReceiptTable.tenant_id == tenant_id,
             ReceiptTable.to_kind == to_kind,
-            ReceiptTable.to_id == to_id,
+            ReceiptTable.to_id.in_(to_ids),
             ReceiptTable.receipt_type.in_(obligation_types),
         )
         
@@ -1059,13 +1133,17 @@ class ReceiptRepository:
             if cursor_time:
                 query = query.where(ReceiptTable.created_at > cursor_time)
         
-        query = query.order_by(ReceiptTable.created_at.asc()).limit(candidate_limit)
+        query = query.order_by(ReceiptTable.created_at.asc()).limit(candidate_limit + 1)
         
         result = await self.session.execute(query)
         candidate_rows = list(result.scalars().all())
         
         if not candidate_rows:
             return [], None
+
+        more_candidates = len(candidate_rows) > candidate_limit
+        if more_candidates:
+            candidate_rows = candidate_rows[:candidate_limit]
         
         # BATCH TERMINATION CHECK (P0.1 optimization)
         # Single query instead of N queries - uses GIN index on parents
@@ -1077,6 +1155,7 @@ class ReceiptRepository:
             select(ReceiptTable.parents)
             .where(
                 ReceiptTable.tenant_id == tenant_id,
+                ReceiptTable.receipt_type.in_(TERMINAL_RECEIPT_TYPES),
                 # Check if parents contains any of our candidate IDs
                 # This uses the GIN index: idx_receipts_parents_gin
                 func.jsonb_array_length(ReceiptTable.parents) > 0,
@@ -1108,6 +1187,8 @@ class ReceiptRepository:
         next_cursor = None
         if len(open_obligations) >= limit:
             next_cursor = open_obligations[-1].receipt_id
+        elif more_candidates and candidate_rows:
+            next_cursor = candidate_rows[-1].receipt_id
         
         return open_obligations[:limit], next_cursor
 
@@ -1144,7 +1225,7 @@ class ProgressRepository:
         progress: dict[str, Any],
     ) -> Progress:
         """Update or create progress for a task."""
-        now = datetime.now(timezone.utc)
+        now = utc_now()
 
         # Upsert
         result = await self.session.execute(
@@ -1210,7 +1291,7 @@ class RelationshipRepository:
         principal_instance_id: str | None = None,
     ) -> Relationship:
         """Create or update relationship."""
-        now = datetime.now(timezone.utc)
+        now = utc_now()
 
         result = await self.session.execute(
             select(RelationshipTable).where(

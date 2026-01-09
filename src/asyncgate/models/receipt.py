@@ -1,6 +1,8 @@
 """Receipt model - immutable contract records."""
 
 from datetime import datetime
+import hashlib
+import json
 from typing import Any, Optional
 from uuid import UUID
 
@@ -43,6 +45,45 @@ class Receipt(BaseModel):
     delivered_at: Optional[datetime] = None
 
     model_config = {"populate_by_name": True}
+
+
+def compute_receipt_hash(
+    receipt_type: ReceiptType,
+    task_id: UUID | None,
+    from_principal: Principal,
+    to_principal: Principal,
+    lease_id: UUID | None,
+    body: dict[str, Any] | None,
+    parents: list[UUID] | None,
+) -> str:
+    """
+    Compute hash for receipt deduplication.
+
+    Includes all fields that make a receipt unique:
+    - receipt_type, task_id, lease_id
+    - from (kind + id)
+    - to (kind + id)
+    - parents (sorted list of UUID strings)
+    - body (canonical JSON)
+    """
+    body_hash = None
+    if body:
+        body_canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        body_hash = hashlib.sha256(body_canonical.encode()).hexdigest()
+
+    data = {
+        "receipt_type": receipt_type.value,
+        "task_id": str(task_id) if task_id else None,
+        "from_kind": from_principal.kind.value,
+        "from_id": from_principal.id,
+        "to_kind": to_principal.kind.value,
+        "to_id": to_principal.id,
+        "lease_id": str(lease_id) if lease_id else None,
+        "parents": sorted([str(p) for p in (parents or [])]),
+        "body_hash": body_hash,
+    }
+    content = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(content.encode()).hexdigest()
 
 
 class ReceiptBody:
@@ -137,7 +178,7 @@ class ReceiptBody:
         status: str,
         result_payload: dict | None = None,
         error: dict | None = None,
-        artifacts: dict | None = None,
+        artifacts: dict | list[dict] | None = None,
         how_to_retrieve: str | None = None,
     ) -> dict[str, Any]:
         """Body for task.result_ready receipt."""

@@ -43,10 +43,12 @@ TERMINATION_RULES: dict[ReceiptType, set[ReceiptType]] = {
 }
 
 # Union of all terminal types (any receipt type that can terminate something)
-# Plus any "always terminal" types that don't reference parents
 TERMINAL_TYPES: set[ReceiptType] = set()
 for terminal_set in TERMINATION_RULES.values():
     TERMINAL_TYPES.update(terminal_set)
+
+# Canonical terminal receipt type set (public alias)
+TERMINAL_RECEIPT_TYPES: set[ReceiptType] = set(TERMINAL_TYPES)
 
 
 def get_terminal_types(obligation_type: ReceiptType) -> set[ReceiptType]:
@@ -79,7 +81,7 @@ def is_terminal_type(receipt_type: ReceiptType) -> bool:
     Returns:
         True if this receipt type appears in any termination rule
     """
-    return receipt_type in TERMINAL_TYPES
+    return receipt_type in TERMINAL_RECEIPT_TYPES
 
 
 def can_terminate_type(

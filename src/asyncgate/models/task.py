@@ -23,7 +23,7 @@ class TaskResult(BaseModel):
     outcome: Outcome
     result: Optional[dict[str, Any]] = None
     error: Optional[dict[str, Any]] = None
-    artifacts: Optional[dict[str, Any]] = None
+    artifacts: Optional[list[dict[str, Any]] | dict[str, Any]] = None
     completed_at: datetime
 
 

@@ -28,12 +28,12 @@ async def test_task_result_has_timezone_aware_datetime(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create and claim task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -53,6 +53,7 @@ async def test_task_result_has_timezone_aware_datetime(session: AsyncSession):
         task_id=task_id,
         lease_id=lease.lease_id,
         result={"status": "done"},
+        artifacts=[{"type": "test", "uri": "mem://timezone/result"}],
     )
     
     await session.commit()
@@ -88,13 +89,13 @@ async def test_failed_task_has_timezone_aware_datetime(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create task with no retries
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
         max_attempts=1,  # No retries
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -146,12 +147,12 @@ async def test_datetime_comparison_works_correctly(session: AsyncSession):
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -183,12 +184,12 @@ async def test_timezone_info_preserved_through_db_roundtrip(session: AsyncSessio
     agent = Principal(kind=PrincipalKind.AGENT, id="test-agent")
     
     # Create and complete task
-    task_id = (await engine.tasks.create(
+    task_id = (await engine.create_task(
         tenant_id=tenant_id,
         type="test_task",
         payload={"data": "test"},
         created_by=agent,
-    )).task_id
+    ))["task_id"]
     
     await session.commit()
     
@@ -210,6 +211,7 @@ async def test_timezone_info_preserved_through_db_roundtrip(session: AsyncSessio
         task_id=task_id,
         lease_id=lease.lease_id,
         result={"status": "done"},
+        artifacts=[{"type": "test", "uri": "mem://timezone/roundtrip"}],
     )
     
     await session.commit()

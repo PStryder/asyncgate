@@ -51,6 +51,10 @@ class ReceiptType(str, Enum):
     TASK_COMPLETED = "task.completed"
     # Task failed (Worker → AsyncGate)
     TASK_FAILED = "task.failed"
+    # Task canceled (Agent/System -> AsyncGate)
+    TASK_CANCELED = "task.canceled"
+    # Retry scheduled after worker failure (non-terminal)
+    TASK_RETRY_SCHEDULED = "task.retry_scheduled"
     # Result delivered to agent (AsyncGate → Agent)
     TASK_RESULT_READY = "task.result_ready"
     # Progress update (Worker → AsyncGate)

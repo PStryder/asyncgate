@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -140,7 +141,7 @@ class LeaseTable(Base):
     task: Mapped[TaskTable] = relationship("TaskTable", back_populates="lease")
 
     __table_args__ = (
-        ForeignKey(
+        ForeignKeyConstraint(
             ["tenant_id", "task_id"],
             ["tasks.tenant_id", "tasks.task_id"],
             ondelete="CASCADE",
@@ -226,7 +227,7 @@ class ProgressTable(Base):
     task: Mapped[TaskTable] = relationship("TaskTable", back_populates="progress")
 
     __table_args__ = (
-        ForeignKey(
+        ForeignKeyConstraint(
             ["tenant_id", "task_id"],
             ["tasks.tenant_id", "tasks.task_id"],
             ondelete="CASCADE",

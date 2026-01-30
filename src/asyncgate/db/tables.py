@@ -34,6 +34,7 @@ class TaskTable(Base):
     # Type and payload
     type: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default={})
+    payload_pointer: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Ownership (immutable)
     created_by_kind: Mapped[str] = mapped_column(
@@ -41,6 +42,7 @@ class TaskTable(Base):
     )
     created_by_id: Mapped[str] = mapped_column(String(255), nullable=False)
     created_by_instance_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    principal_ai: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Requirements
     requirements: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default={})
@@ -109,6 +111,7 @@ class TaskTable(Base):
         Index("idx_tasks_running", "tenant_id", "status", "started_at"),
         # Index for instance ownership
         Index("idx_tasks_instance", "asyncgate_instance"),
+        Index("idx_tasks_principal_ai", "tenant_id", "principal_ai"),
     )
 
 

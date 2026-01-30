@@ -1,10 +1,25 @@
-"""Adapter for rendering AsyncGate receipts in MemoryGate schema."""
+"""Adapter for rendering AsyncGate receipts in LegiVellum receipt schema."""
 
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 from asyncgate.models import Principal, Receipt, ReceiptType, Task
 from asyncgate.models.enums import Outcome
+
+try:
+    from legivellum.models import Receipt as CanonicalReceipt
+except ImportError:
+    shared_root = Path(__file__).resolve().parents[4] / "LegiVellum" / "shared"
+    if shared_root.exists():
+        sys.path.append(str(shared_root))
+        try:
+            from legivellum.models import Receipt as CanonicalReceipt
+        except ImportError:
+            CanonicalReceipt = None
+    else:
+        CanonicalReceipt = None
 
 
 def _principal_value(principal: Principal) -> str:
@@ -81,6 +96,8 @@ def _derive_phase_and_status(receipt: Receipt, task: Task | None) -> tuple[str, 
 def _derive_outcome_kind(receipt: Receipt, task: Task | None) -> str:
     body = receipt.body or {}
     artifacts = body.get("artifacts")
+    if artifacts is None and task and task.result:
+        artifacts = task.result.artifacts
     result_payload = body.get("result_payload")
     error_payload = body.get("error")
 
@@ -122,7 +139,10 @@ def to_memorygate_receipt(receipt: Receipt, task: Task | None) -> dict[str, Any]
     if outcome_text == "NA" and isinstance(body.get("error"), dict):
         outcome_text = body["error"].get("message") or "NA"
 
-    artifact_fields = _extract_artifact_fields(body.get("artifacts"))
+    artifacts_source = body.get("artifacts")
+    if artifacts_source is None and task and task.result:
+        artifacts_source = task.result.artifacts
+    artifact_fields = _extract_artifact_fields(artifacts_source)
 
     expected_outcome_kind = (
         task.expected_outcome_kind if task and task.expected_outcome_kind else "NA"
@@ -137,8 +157,16 @@ def to_memorygate_receipt(receipt: Receipt, task: Task | None) -> dict[str, Any]
     if task and task.result and task.result.completed_at:
         completed_at = task.result.completed_at.isoformat()
 
-    inputs = task.payload if task else {}
-    task_body = json.dumps(inputs) if inputs else ""
+    inputs: dict[str, Any] = {}
+    task_body = "TBD"
+    if task:
+        if task.payload_pointer:
+            inputs["payload_pointer"] = task.payload_pointer
+        if task.payload:
+            inputs["payload"] = task.payload
+            task_body = json.dumps(task.payload)
+        elif task.payload_pointer:
+            task_body = task.payload_pointer
 
     caused_by = str(receipt.parents[0]) if receipt.parents else "NA"
 
@@ -159,7 +187,21 @@ def to_memorygate_receipt(receipt: Receipt, task: Task | None) -> dict[str, Any]
     if "trace_id" in body:
         metadata["trace_id"] = body["trace_id"]
 
-    return {
+    if task:
+        owner_principal = _principal_value(task.created_by)
+        from_principal = owner_principal
+        for_principal = owner_principal
+        recipient_ai = task.principal_ai or _principal_value(receipt.to_)
+    else:
+        from_principal = _principal_value(receipt.from_)
+        for_principal = _principal_value(receipt.to_)
+        recipient_ai = for_principal
+    if phase == "escalate":
+        escalation_target = escalation_fields.get("escalation_to")
+        if escalation_target and escalation_target != "NA":
+            recipient_ai = escalation_target
+
+    payload = {
         "schema_version": "1.0",
         "tenant_id": str(receipt.tenant_id),
         "receipt_id": str(receipt.receipt_id),
@@ -168,10 +210,10 @@ def to_memorygate_receipt(receipt: Receipt, task: Task | None) -> dict[str, Any]
         "caused_by_receipt_id": caused_by,
         "dedupe_key": receipt.hash or "NA",
         "attempt": task.attempt if task else 0,
-        "from_principal": _principal_value(receipt.from_),
-        "for_principal": _principal_value(receipt.to_),
+        "from_principal": from_principal,
+        "for_principal": for_principal,
         "source_system": "asyncgate",
-        "recipient_ai": _principal_value(receipt.to_),
+        "recipient_ai": recipient_ai,
         "trust_domain": "default",
         "phase": phase,
         "status": status,
@@ -194,3 +236,8 @@ def to_memorygate_receipt(receipt: Receipt, task: Task | None) -> dict[str, Any]
         "archived_at": None,
         "metadata": metadata,
     }
+
+    if CanonicalReceipt is None:
+        return payload
+
+    return CanonicalReceipt.model_validate(payload).model_dump(mode="json")

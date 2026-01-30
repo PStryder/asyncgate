@@ -81,6 +81,8 @@ def create_mcp_server() -> Server:
                     "properties": {
                         "type": {"type": "string", "description": "Task type"},
                         "payload": {"type": "object", "description": "Task payload"},
+                        "payload_pointer": {"type": "string", "description": "Pointer to task payload"},
+                        "principal_ai": {"type": "string", "description": "Principal AI that owns the obligation"},
                         "requirements": {"type": "object", "description": "Task requirements"},
                         "expected_outcome_kind": {"type": "string", "description": "Expected outcome kind"},
                         "expected_artifact_mime": {"type": "string", "description": "Expected artifact MIME"},
@@ -92,7 +94,7 @@ def create_mcp_server() -> Server:
                         "agent_id": {"type": "string", "description": "Creating agent ID"},
                         "tenant_id": {"type": "string", "description": "Tenant ID"},
                     },
-                    "required": ["type", "payload", "agent_id", "tenant_id"],
+                    "required": ["type", "principal_ai", "agent_id", "tenant_id"],
                 }),
             ),
             Tool(
@@ -321,8 +323,10 @@ async def _handle_tool(name: str, arguments: dict[str, Any]) -> Any:
             return await engine.create_task(
                 tenant_id=UUID(arguments["tenant_id"]),
                 type=arguments["type"],
-                payload=arguments["payload"],
+                payload=arguments.get("payload") or {},
+                payload_pointer=arguments.get("payload_pointer"),
                 created_by=created_by,
+                principal_ai=arguments["principal_ai"],
                 requirements=arguments.get("requirements"),
                 expected_outcome_kind=arguments.get("expected_outcome_kind"),
                 expected_artifact_mime=arguments.get("expected_artifact_mime"),

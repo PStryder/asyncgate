@@ -8,8 +8,8 @@ from asyncgate.integrations.circuit_breaker import (
     CircuitState,
 )
 from asyncgate.integrations.memorygate_client import (
-    MemoryGateClient,
-    get_memorygate_client,
+    ReceiptGateClient,
+    get_receiptgate_client,
 )
 
 __all__ = [
@@ -18,6 +18,6 @@ __all__ = [
     "CircuitBreakerOpen",
     "CircuitBreakerStats",
     "CircuitState",
-    "MemoryGateClient",
-    "get_memorygate_client",
+    "ReceiptGateClient",
+    "get_receiptgate_client",
 ]

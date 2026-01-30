@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import json
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,7 +21,7 @@ class ReceiptMode(str, Enum):
     """Receipt storage mode."""
 
     STANDALONE = "standalone"
-    MEMORYGATE_INTEGRATED = "memorygate_integrated"
+    RECEIPTGATE_INTEGRATED = "receiptgate_integrated"
 
 
 class EscalationTarget(BaseModel):
@@ -63,29 +63,45 @@ class Settings(BaseSettings):
     # Receipt mode
     receipt_mode: ReceiptMode = ReceiptMode.STANDALONE
 
-    # MemoryGate integration (only used if receipt_mode = MEMORYGATE_INTEGRATED)
-    memorygate_url: Optional[str] = None
-    memorygate_token: Optional[str] = None
-    memorygate_tenant_id: Optional[str] = None
-    memorygate_emission_timeout_ms: int = 500
-    memorygate_emission_buffer_size: int = 10000
-    memorygate_emission_retry_interval_seconds: int = 30
-    memorygate_emission_max_retries: int = 10
-
-    # MemoryGate circuit breaker
-    memorygate_circuit_breaker_enabled: bool = Field(
-        default=True, description="Enable circuit breaker for MemoryGate calls"
+    # ReceiptGate integration (only used if receipt_mode = RECEIPTGATE_INTEGRATED)
+    receiptgate_endpoint: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ASYNCGATE_RECEIPTGATE_ENDPOINT",
+            "ASYNCGATE_RECEIPTGATE_URL",
+            "RECEIPTGATE_ENDPOINT",
+            "RECEIPTGATE_URL",
+        ),
     )
-    memorygate_circuit_breaker_failure_threshold: int = Field(
+    receiptgate_auth_token: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ASYNCGATE_RECEIPTGATE_AUTH_TOKEN",
+            "ASYNCGATE_RECEIPTGATE_API_KEY",
+            "RECEIPTGATE_AUTH_TOKEN",
+            "RECEIPTGATE_API_KEY",
+        ),
+    )
+    receiptgate_tenant_id: Optional[str] = None
+    receiptgate_emission_timeout_ms: int = 500
+    receiptgate_emission_buffer_size: int = 10000
+    receiptgate_emission_retry_interval_seconds: int = 30
+    receiptgate_emission_max_retries: int = 10
+
+    # ReceiptGate circuit breaker
+    receiptgate_circuit_breaker_enabled: bool = Field(
+        default=True, description="Enable circuit breaker for ReceiptGate calls"
+    )
+    receiptgate_circuit_breaker_failure_threshold: int = Field(
         default=5, description="Failures before opening circuit"
     )
-    memorygate_circuit_breaker_timeout_seconds: int = Field(
+    receiptgate_circuit_breaker_timeout_seconds: int = Field(
         default=60, description="Seconds before attempting half-open"
     )
-    memorygate_circuit_breaker_half_open_max_calls: int = Field(
+    receiptgate_circuit_breaker_half_open_max_calls: int = Field(
         default=3, description="Test calls in half-open state"
     )
-    memorygate_circuit_breaker_success_threshold: int = Field(
+    receiptgate_circuit_breaker_success_threshold: int = Field(
         default=2, description="Successes to close from half-open"
     )
 
@@ -205,7 +221,7 @@ class Settings(BaseSettings):
             raise ValueError(f"Port must be between 1 and 65535, got {v}")
         return v
 
-    @field_validator("memorygate_url", "redis_url")
+    @field_validator("receiptgate_endpoint", "redis_url")
     @classmethod
     def validate_integration_url(cls, v: Optional[str]) -> Optional[str]:
         """Validate integration URLs are HTTP(S) or redis://."""

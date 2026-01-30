@@ -36,10 +36,14 @@ class Task(BaseModel):
 
     # Type and payload
     type: str
+    # NOTE: payload is legacy inline data; prefer payload_pointer for LegiVellum compliance.
     payload: dict[str, Any] = Field(default_factory=dict)
+    payload_pointer: Optional[str] = None
 
     # Ownership (immutable after creation)
     created_by: Principal
+    # Principal AI that owns the obligation (LegiVellum requirement)
+    principal_ai: str
 
     # Requirements for execution
     requirements: TaskRequirements = Field(default_factory=TaskRequirements)

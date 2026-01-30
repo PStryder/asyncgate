@@ -301,8 +301,10 @@ async def create_task(
         result = await engine.create_task(
             tenant_id=tenant_id,
             type=request.type,
-            payload=request.payload,
+            payload=request.payload or {},
+            payload_pointer=request.payload_pointer,
             created_by=created_by,
+            principal_ai=request.principal_ai,
             requirements=request.requirements,
             expected_outcome_kind=request.expected_outcome_kind,
             expected_artifact_mime=request.expected_artifact_mime,

@@ -48,7 +48,14 @@ class CreateTaskRequest(BaseModel):
     """Create task request."""
 
     type: str = Field(..., description="Task type")
-    payload: dict[str, Any] = Field(default_factory=dict, description="Task payload")
+    payload: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Legacy inline payload (prefer payload_pointer)",
+    )
+    payload_pointer: Optional[str] = Field(
+        None, description="Pointer to task payload stored in DepotGate or external store"
+    )
+    principal_ai: str = Field(..., description="Principal AI that owns the obligation")
     requirements: Optional[dict[str, Any]] = Field(None, description="Task requirements")
     expected_outcome_kind: Optional[str] = Field(None, description="Expected outcome kind")
     expected_artifact_mime: Optional[str] = Field(None, description="Expected artifact MIME type")
@@ -72,7 +79,9 @@ class TaskResponse(BaseModel):
     task_id: UUID
     type: str
     payload: dict[str, Any]
+    payload_pointer: Optional[str] = None
     created_by: dict[str, Any]
+    principal_ai: str
     requirements: dict[str, Any]
     expected_outcome_kind: Optional[str] = None
     expected_artifact_mime: Optional[str] = None
@@ -150,10 +159,13 @@ class LeaseClaimRequest(BaseModel):
 class LeaseInfoSchema(BaseModel):
     """Leased task info."""
 
+    tenant_id: Optional[UUID] = None
     task_id: UUID
     lease_id: UUID
     type: str
     payload: dict[str, Any]
+    payload_pointer: Optional[str] = None
+    principal_ai: str
     attempt: int
     expires_at: datetime
     requirements: Optional[dict[str, Any]] = None
@@ -267,7 +279,7 @@ class ConfigResponse(BaseModel):
     """Config response."""
 
     receipt_mode: str
-    memorygate_url: Optional[str] = None
+    receiptgate_endpoint: Optional[str] = None
     instance_id: str
     capabilities: list[str]
     version: str

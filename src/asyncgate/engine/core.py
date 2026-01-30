@@ -1,6 +1,7 @@
 """AsyncGate core engine - canonical operations."""
 
 import asyncio
+import logging
 from time import perf_counter
 from typing import Any
 from uuid import UUID
@@ -8,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from asyncgate.config import settings
+from asyncgate.config import ReceiptMode, settings
 from asyncgate.db.repositories import (
     LeaseRepository,
     ProgressRepository,
@@ -48,10 +49,12 @@ from asyncgate.principals import (
     normalize_external,
 )
 from asyncgate.receipts import to_memorygate_receipt
+from asyncgate.integrations import get_receiptgate_client
 from asyncgate.observability.metrics import metrics
 from asyncgate.observability.trace import ensure_trace_id, get_trace_id
 from asyncgate.utils.time import utc_now
 
+logger = logging.getLogger(__name__)
 
 class AsyncGateEngine:
     """Core engine implementing canonical AsyncGate operations."""
@@ -218,7 +221,9 @@ class AsyncGateEngine:
         tenant_id: UUID,
         type: str,
         payload: dict[str, Any],
+        payload_pointer: str | None = None,
         created_by: Principal,
+        principal_ai: str,
         requirements: dict[str, Any] | None = None,
         expected_outcome_kind: str | None = None,
         expected_artifact_mime: str | None = None,
@@ -243,11 +248,16 @@ class AsyncGateEngine:
         if requirements:
             task_requirements = TaskRequirements(**requirements)
 
+        if not principal_ai:
+            raise ValueError("principal_ai is required")
+
         task = await self.tasks.create(
             tenant_id=tenant_id,
             type=type,
             payload=payload,
+            payload_pointer=payload_pointer,
             created_by=created_by,
+            principal_ai=principal_ai,
             requirements=task_requirements,
             expected_outcome_kind=expected_outcome_kind,
             expected_artifact_mime=expected_artifact_mime,
@@ -539,10 +549,13 @@ class AsyncGateEngine:
                 )
 
                 results.append({
+                    "tenant_id": task.tenant_id,
                     "task_id": task.task_id,
                     "lease_id": lease.lease_id,
                     "type": task.type,
                     "payload": task.payload,
+                    "payload_pointer": task.payload_pointer,
+                    "principal_ai": task.principal_ai,
                     "attempt": task.attempt,
                     "expires_at": lease.expires_at,
                     "requirements": task.requirements.model_dump() if task.requirements else None,
@@ -950,11 +963,9 @@ class AsyncGateEngine:
                     await self._emit_escalation_receipt(
                         tenant_id=lease.tenant_id,
                         task=task,
-                        reason=(
-                            f"Lease expired for task {task.task_id} "
-                            f"(worker {lease.worker_id})"
-                        ),
+                        reason="lease_expired",
                         escalation_class=escalation_class,
+                        escalation_class_label="policy",
                         obligation=obligation,
                         lease_id=lease.lease_id,
                     )
@@ -1078,7 +1089,7 @@ class AsyncGateEngine:
         """Return operational configuration."""
         return {
             "receipt_mode": settings.receipt_mode.value,
-            "memorygate_url": settings.memorygate_url,
+            "receiptgate_endpoint": settings.receiptgate_endpoint,
             "instance_id": settings.instance_id,
             "capabilities": ["lease_based_execution", "receipt_emission"],
             "version": "0.1.0",
@@ -1151,6 +1162,7 @@ class AsyncGateEngine:
         task: Task,
         reason: str,
         escalation_class: int,
+        escalation_class_label: str = "other",
         obligation: Receipt | None = None,
         lease_id: UUID | None = None,
     ) -> Receipt | None:
@@ -1159,20 +1171,23 @@ class AsyncGateEngine:
             return None
 
         target = settings.get_escalation_target(escalation_class)
-        if not target:
-            return None
-
         target_tenant_id = tenant_id
-        if target.tenant_id:
+        if target and target.tenant_id:
             try:
                 target_tenant_id = UUID(target.tenant_id)
             except ValueError:
                 target_tenant_id = tenant_id
 
-        to_principal = Principal(
-            kind=PrincipalKind(target.to_kind),
-            id=normalize_external(target.to_id),
-        )
+        if target:
+            to_principal = Principal(
+                kind=PrincipalKind(target.to_kind),
+                id=normalize_external(target.to_id),
+            )
+            escalation_to = target.to_id
+        else:
+            fallback = obligation.to_ if obligation else task.created_by
+            to_principal = fallback
+            escalation_to = fallback.id
 
         parents = [obligation.receipt_id] if obligation else None
 
@@ -1185,9 +1200,9 @@ class AsyncGateEngine:
             lease_id=lease_id,
             parents=parents,
             body=ReceiptBody.task_escalated(
-                escalation_class=str(escalation_class),
+                escalation_class=escalation_class_label,
                 escalation_reason=reason,
-                escalation_to=target.to_id,
+                escalation_to=escalation_to,
                 expected_outcome_kind=task.expected_outcome_kind,
                 expected_artifact_mime=task.expected_artifact_mime,
             ),
@@ -1205,7 +1220,7 @@ class AsyncGateEngine:
         body: dict[str, Any] | None = None,
         parents: list[UUID] | None = None,
     ) -> Receipt:
-        """Emit a receipt (either locally or to MemoryGate)."""
+        """Emit a receipt (either locally or to ReceiptGate)."""
         trace_id = get_trace_id() or ensure_trace_id()
         body_payload = dict(body) if body else {}
         if trace_id and "trace_id" not in body_payload:
@@ -1226,6 +1241,31 @@ class AsyncGateEngine:
         )
         metrics.inc_counter("receipts.emitted.count")
         metrics.observe("receipts.emit_latency_ms", (perf_counter() - start_time) * 1000.0)
+
+        if settings.receipt_mode == ReceiptMode.RECEIPTGATE_INTEGRATED and settings.receiptgate_endpoint:
+            eligible = {
+                ReceiptType.TASK_ASSIGNED,
+                ReceiptType.TASK_ACCEPTED,
+                ReceiptType.TASK_COMPLETED,
+                ReceiptType.TASK_FAILED,
+                ReceiptType.TASK_CANCELED,
+                ReceiptType.TASK_ESCALATED,
+            }
+            if receipt_type not in eligible:
+                return receipt
+            try:
+                task = await self.tasks.get(tenant_id, task_id) if task_id else None
+                receipt_payload = to_memorygate_receipt(receipt, task)
+                client = get_receiptgate_client()
+                await client.emit_receipt(receipt_payload)
+            except Exception as exc:
+                logger.warning(
+                    "receiptgate_receipt_emit_failed",
+                    receipt_type=receipt_type.value,
+                    task_id=str(task_id) if task_id else None,
+                    error=str(exc),
+                )
+
         return receipt
 
     async def _emit_result_ready_receipt(
@@ -1295,10 +1335,12 @@ class AsyncGateEngine:
             "task_id": task.task_id,
             "type": task.type,
             "payload": task.payload,
+            "payload_pointer": task.payload_pointer,
             "created_by": {
                 "kind": task.created_by.kind.value,
                 "id": task.created_by.id,
             },
+            "principal_ai": task.principal_ai,
             "requirements": task.requirements.model_dump() if task.requirements else {},
             "expected_outcome_kind": task.expected_outcome_kind,
             "expected_artifact_mime": task.expected_artifact_mime,

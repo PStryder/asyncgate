@@ -1,5 +1,7 @@
 """Database repositories for AsyncGate entities."""
 
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -59,7 +61,9 @@ class TaskRepository:
         tenant_id: UUID,
         type: str,
         payload: dict[str, Any],
+        payload_pointer: str | None = None,
         created_by: Principal,
+        principal_ai: str,
         requirements: TaskRequirements | None = None,
         expected_outcome_kind: str | None = None,
         expected_artifact_mime: str | None = None,
@@ -80,15 +84,19 @@ class TaskRepository:
         task_id = uuid4()
 
         next_eligible_at = now + timedelta(seconds=delay_seconds) if delay_seconds else None
+        resolved_payload_pointer = payload_pointer or f"inline://task/{task_id}"
+        resolved_principal_ai = principal_ai
 
         task_row = TaskTable(
             tenant_id=tenant_id,
             task_id=task_id,
             type=type,
             payload=payload,
+            payload_pointer=resolved_payload_pointer,
             created_by_kind=created_by.kind,
             created_by_id=created_by.id,
             created_by_instance_id=created_by.instance_id,
+            principal_ai=resolved_principal_ai,
             requirements=requirements.model_dump() if requirements else {},
             expected_outcome_kind=expected_outcome_kind,
             expected_artifact_mime=expected_artifact_mime,
@@ -344,11 +352,13 @@ class TaskRepository:
             tenant_id=row.tenant_id,
             type=row.type,
             payload=row.payload,
+            payload_pointer=row.payload_pointer,
             created_by=Principal(
                 kind=PrincipalKind(row.created_by_kind),
                 id=row.created_by_id,
                 instance_id=row.created_by_instance_id,
             ),
+            principal_ai=row.principal_ai or row.created_by_id,
             requirements=TaskRequirements(**row.requirements),
             priority=row.priority,
             status=row.status,

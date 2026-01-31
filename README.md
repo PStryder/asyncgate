@@ -46,6 +46,13 @@ alembic upgrade head
 asyncgate
 ```
 
+### One-Command Local Run (Docker Compose)
+
+```bash
+./run_local.sh
+# Windows PowerShell: .\run_local.ps1
+```
+
 ### Docker
 
 ```bash
@@ -86,6 +93,12 @@ See [k8s/README.md](k8s/README.md) for details.
 ### Docker Compose (Development)
 ```bash
 docker-compose up --build
+```
+
+## Golden Path Demo
+
+```bash
+python scripts/golden_path.py
 ```
 
 ## API
@@ -158,7 +171,16 @@ Environment variables (prefix `ASYNCGATE_`):
 | `MAX_LEASE_LIFETIME_SECONDS` | 7200 | Absolute max lease lifetime (2 hours) |
 | `DEFAULT_MAX_ATTEMPTS` | 2 | Default max retry attempts |
 | `DEFAULT_RETRY_BACKOFF_SECONDS` | 15 | Default retry backoff |
-| `RECEIPT_MODE` | standalone | Receipt storage mode (standalone/memorygate_integrated) |
+| `RECEIPT_MODE` | standalone | Receipt storage mode (standalone/receiptgate_integrated) |
+| `RECEIPTGATE_ENDPOINT` | - | ReceiptGate MCP endpoint URL (accepts RECEIPTGATE_URL alias) |
+| `RECEIPTGATE_AUTH_TOKEN` | - | ReceiptGate auth token/API key (accepts RECEIPTGATE_API_KEY alias) |
+| `RECEIPTGATE_TENANT_ID` | - | Tenant ID to stamp in ReceiptGate receipts |
+| `RECEIPTGATE_EMISSION_TIMEOUT_MS` | 500 | ReceiptGate request timeout (ms) |
+| `RECEIPTGATE_EMISSION_MAX_RETRIES` | 10 | ReceiptGate retry count |
+| `RECEIPTGATE_CIRCUIT_BREAKER_ENABLED` | true | Enable circuit breaker |
+| `ESCALATION_ENABLED` | false | Emit escalation receipts |
+| `ESCALATION_TARGETS` | - | JSON array of escalation targets |
+| `ESCALATION_LEASE_EXPIRY_CLASS` | 1 | Escalation class for lease expiry |
 | `API_KEY` | - | API key for authentication |
 | `ALLOW_INSECURE_DEV` | false | Allow unauthenticated in dev mode |
 | `RATE_LIMIT_ENABLED` | true | Enable rate limiting |
@@ -196,6 +218,20 @@ Terminal states: `succeeded`, `failed`, `canceled`
 4. Idempotent creation: same idempotency_key returns same task_id
 5. Terminal states are immutable
 6. State machine is authoritative; receipts are proofs
+
+## Receipt Types & Termination
+
+Receipt types are enumerated in `src/asyncgate/models/enums.py` (`ReceiptType`).
+Termination rules and `TERMINAL_RECEIPT_TYPES` live in
+`src/asyncgate/models/termination.py`.
+
+Terminal receipt types for task obligations:
+
+- `task.completed`
+- `task.failed`
+- `task.canceled`
+
+Terminator detection is type-gated: only terminal receipt types close obligations.
 
 ## License
 

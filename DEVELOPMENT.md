@@ -26,6 +26,13 @@ If you get an error, start Docker Desktop from your Applications/Start Menu.
 docker-compose up --build
 ```
 
+One-command alternative:
+
+```bash
+./run_local.sh
+# Windows PowerShell: .\run_local.ps1
+```
+
 This will:
 - Build the AsyncGate Docker image
 - Start PostgreSQL container
@@ -191,6 +198,12 @@ Once AsyncGate is running locally:
 2. Create custom workers in `workers/`
 3. Test different task types and receipt chains
 4. Develop against local instance before deploying
+
+Golden path demo (minimal worker loop):
+
+```bash
+python scripts/golden_path.py
+```
 
 ## Support
 
